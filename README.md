@@ -32,7 +32,7 @@ Backing up photos from an Android phone on Linux is notoriously painful. SyncUp 
 
 ### Building from Source
 
-    git clone https://github.com/YOUR_USERNAME/syncup.git
+    git clone https://github.com/Lotus-Projects-3421/syncup.git
     cd syncup
     pip install -r requirements.txt
     python main.py
