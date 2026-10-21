@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Flet / Build artifacts
+build/
+dist/
+*.AppImage
+AppDir/
+
+# User data / configs
+*.log
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Personal notes, tools, and context files (not for GitHub)
+appimagetool
+VIRTUAL environmentr start.txt
+README and CONTEXT HANDOFF.md
+
+# App user data
+profiles-data/
