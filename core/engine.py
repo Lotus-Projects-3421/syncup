@@ -92,7 +92,7 @@ def run_backup(phone_id, phone_path, selected_folders, staging_path, dest_path, 
             
             if do_copy:
                 temp_dst = staging_root / f"tmp_{src_file.name}"
-                shutil.copy2(src_file, temp_dst)
+                shutil.copyfile(src_file, temp_dst)
                 shutil.move(temp_dst, dst_file)
                 processed_files.add(rel_path)
                 if processed % 10 == 0: save_state(phone_id, processed_files)
