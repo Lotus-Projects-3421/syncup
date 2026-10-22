@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.lotus_projects_3421.SyncUp</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>SyncUp</name>
+  <summary>Safe Android photo/video backup and Takeout organizer</summary>
+  <description>
+    <p>
+      SyncUp backs up Android phones over MTP and organizes Google Takeout
+      archives without deleting or replacing a destination until the new copy
+      has been fully written and verified.
+    </p>
+    <ul>
+      <li>Atomic, size-verified phone backups with resumable state.</li>
+      <li>Streamed Google Takeout ZIP processing without extractall().</li>
+      <li>Duplicate finder with preview, manifest, and undo.</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.lotus_projects_3421.SyncUp.desktop</launchable>
+  <url type="homepage">https://github.com/Lotus-Projects-3421/syncup</url>
+  <url type="bugtracker">https://github.com/Lotus-Projects-3421/syncup/issues</url>
+  <developer id="io.github.lotus_projects_3421">
+    <name>SyncUp contributors</name>
+  </developer>
+  <provides>
+    <binary>SyncUp</binary>
+  </provides>
+  <releases>
+    <release version="@VERSION@" date="2026-10-22"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>

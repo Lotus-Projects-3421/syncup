@@ -4,15 +4,25 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.pytest_cache/
+.ruff_cache/
+
+# Atomic-copy temporary files
+*.part-*
 
 # Flet / Build artifacts
 build/
 dist/
 *.AppImage
 AppDir/
+*.spec.bak
 
 # User data / configs
 *.log
+*.db
+*.db-wal
+*.db-shm
+*.db.corrupt-*
 
 # IDE and OS files
 .vscode/
@@ -24,6 +34,9 @@ Thumbs.db
 appimagetool
 VIRTUAL environmentr start.txt
 README and CONTEXT HANDOFF.md
+
+# Local archive of old releases, notes, and profiles (not for GitHub)
+archive/
 
 # App user data
 profiles-data/

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=SyncUp
+Exec=SyncUp
+Icon=syncup
+Type=Application
+Terminal=false
+Categories=Graphics;Photography;
+Comment=Photo & Video Backup & Organizer
+X-AppImage-Version=@VERSION@
+StartupWMClass=SyncUp
