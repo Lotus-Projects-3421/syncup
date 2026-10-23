@@ -14,7 +14,10 @@ from views.common import (
     card,
     finish_job,
     open_folder,
+    progress_callback_for,
     register_job,
+    show_scoreboard,
+    show_snack,
 )
 
 
@@ -40,6 +43,14 @@ def build_phone_view(
     }
 
     p_dest = ft.TextField(label="Destination folder", expand=True, read_only=True)
+
+    def p_open_destination(event=None) -> None:
+        def _on_error(message: str) -> None:
+            log_func(message, is_error=True, level="error")
+            show_snack(page, message, is_error=True)
+
+        if open_folder(p_state["destination"], on_error=_on_error):
+            show_snack(page, "Opened in file manager")
 
     async def p_pick_dest(e):
         path = await file_picker.get_directory_path(dialog_title="Select Destination")
@@ -318,7 +329,7 @@ def build_phone_view(
 
     cancel_btn.on_click = p_cancel
 
-    def _finish(result: dict) -> None:
+    def _finish(result: dict, destination: str) -> None:
         finish_job(state)
         if result.get("error"):
             log_func(result["error"], is_error=True)
@@ -327,23 +338,26 @@ def build_phone_view(
                 "Backup cancelled: "
                 f"{result.get('processed', 0)} copied, "
                 f"{result.get('skipped', 0)} skipped, "
-                f"{result.get('errors', 0)} errors."
+                f"{result.get('errors', 0)} errors.",
+                level="warning",
             )
         else:
             log_func(
                 f"✅ Phone backup finished in {result.get('time', '?')}: "
                 f"{result.get('processed', 0)} copied, "
                 f"{result.get('skipped', 0)} skipped, "
-                f"{result.get('errors', 0)} errors."
+                f"{result.get('errors', 0)} errors.",
+                level="success",
             )
             if result.get("total", 0) == 0:
                 if result.get("errors", 0):
                     log_func(
                         "No new files were copied because some files could not "
-                        "be read. See the errors above."
+                        "be read. See the errors above.",
+                        level="warning",
                     )
                 else:
-                    log_func("Nothing new to copy.")
+                    log_func("Nothing new to copy.", level="warning")
 
         if (
             not result.get("error")
@@ -353,6 +367,14 @@ def build_phone_view(
             play_sound()
 
         progress_queue.put((0, 0, ""))
+        show_scoreboard(
+            page,
+            result,
+            title="Phone Backup Summary",
+            destination=destination,
+            operation="backup",
+            log_func=log_func,
+        )
         page.update()
 
     def p_start(event) -> None:
@@ -390,12 +412,11 @@ def build_phone_view(
         except Exception as exc:  # noqa: BLE001 - profile is a convenience
             log_func(f"Could not save profile: {exc}", is_error=True)
 
-        log_func("Starting Phone Backup...")
+        log_func("Starting Phone Backup...", level="organize")
         begin_job(state, cancel_btn)
         page.update()
 
-        def progress_cb(current, total, message):
-            progress_queue.put((current, total, message))
+        progress_cb = progress_callback_for(progress_queue, log_func)
 
         def error_cb(name, message):
             log_func(f"Failed: {name}: {message}", is_error=True)
@@ -419,7 +440,7 @@ def build_phone_view(
                 log_func(f"Error: {exc}", is_error=True)
                 result = {"error": str(exc)}
             finally:
-                post_ui(lambda: _finish(result))
+                post_ui(lambda: _finish(result, destination))
 
         page.run_thread(run)
 
@@ -486,9 +507,7 @@ def build_phone_view(
                                 ft.IconButton(
                                     ft.Icons.FOLDER_OPEN,
                                     tooltip="Open Destination",
-                                    on_click=lambda e: open_folder(
-                                        p_state["destination"]
-                                    ),
+                                    on_click=p_open_destination,
                                 ),
                             ]
                         ),

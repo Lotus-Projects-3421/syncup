@@ -12,7 +12,10 @@ from views.common import (
     finish_job,
     human_size,
     open_folder,
+    progress_callback_for,
     register_job,
+    show_scoreboard,
+    show_snack,
 )
 
 
@@ -33,6 +36,14 @@ def build_dedup_view(
         size=12,
         color=ft.Colors.GREY_500,
     )
+
+    def d_open_folder(event=None) -> None:
+        def _on_error(message: str) -> None:
+            log_func(message, is_error=True, level="error")
+            show_snack(page, message, is_error=True)
+
+        if open_folder(d_state["scan_dir"], on_error=_on_error):
+            show_snack(page, "Opened in file manager")
 
     async def d_pick_folder(e):
         path = await file_picker.get_directory_path(dialog_title="Select Folder to scan")
@@ -90,13 +101,14 @@ def build_dedup_view(
 
     def _finish(result: dict, mode: str, scan_dir: str | None = None) -> None:
         finish_job(state)
+        show_summary = True
 
         if result.get("error"):
             log_func(result["error"], is_error=True)
             if mode == "preview":
                 d_preview_text.value = "Preview failed. See the activity log."
         elif result.get("cancelled"):
-            log_func(f"{mode.title()} cancelled.")
+            log_func(f"{mode.title()} cancelled.", level="warning")
         elif mode == "preview":
             if scan_dir is not None and scan_dir != d_state["scan_dir"]:
                 d_state["preview"] = None
@@ -109,6 +121,7 @@ def build_dedup_view(
                     "the result was discarded.",
                     is_error=True,
                 )
+                show_summary = False
             else:
                 count = result.get("duplicates", 0)
                 groups = result.get("groups", 0)
@@ -127,7 +140,8 @@ def build_dedup_view(
                     )
                     log_func(
                         f"Preview complete: {count} duplicate(s) in {groups} group(s), "
-                        f"{size} movable. Nothing was moved.{error_suffix}"
+                        f"{size} movable. Nothing was moved.{error_suffix}",
+                        level="success",
                     )
                     _log_groups(result)
                 else:
@@ -136,12 +150,16 @@ def build_dedup_view(
                     d_preview_text.value = (
                         f"Preview: no exact duplicates found.{error_suffix}"
                     )
-                    log_func(f"Preview complete: no exact duplicates found.{error_suffix}")
+                    log_func(
+                        f"Preview complete: no exact duplicates found.{error_suffix}",
+                        level="success",
+                    )
         elif mode == "move":
             moved = result.get("moved", 0)
             log_func(
                 f"✅ Duplicate move finished in {result.get('time', '?')}: "
-                f"{moved} file(s) moved, {result.get('errors', 0)} errors."
+                f"{moved} file(s) moved, {result.get('errors', 0)} errors.",
+                level="success" if not result.get("errors") else "error",
             )
             if result.get("manifest"):
                 log_func(f"Undo manifest: {result['manifest']}")
@@ -155,7 +173,8 @@ def build_dedup_view(
                 f"↩️ Undo finished in {result.get('time', '?')}: "
                 f"{result.get('restored', 0)} restored, "
                 f"{result.get('skipped', 0)} skipped, "
-                f"{result.get('errors', 0)} errors."
+                f"{result.get('errors', 0)} errors.",
+                level="success" if not result.get("errors") else "error",
             )
             d_state["preview"] = None
             d_state["preview_scan_dir"] = None
@@ -172,6 +191,20 @@ def build_dedup_view(
                 play_sound()
 
         progress_queue.put((0, 0, ""))
+        if show_summary:
+            titles = {
+                "preview": "Duplicate Scan Summary",
+                "move": "Duplicate Move Summary",
+                "undo": "Duplicate Undo Summary",
+            }
+            show_scoreboard(
+                page,
+                result,
+                title=titles.get(mode, "Duplicate Summary"),
+                destination=scan_dir if mode in {"move", "undo"} else None,
+                operation=mode,
+                log_func=log_func,
+            )
         page.update()
 
     def d_preview(event=None) -> None:
@@ -184,12 +217,11 @@ def build_dedup_view(
         scan_dir = d_state["scan_dir"]
         d_state["preview"] = None
         d_state["preview_scan_dir"] = None
-        log_func("Scanning for duplicates (preview only)...")
+        log_func("Scanning for duplicates (preview only)...", level="scan")
         begin_job(state, cancel_btn)
         page.update()
 
-        def progress_cb(current, total, message):
-            progress_queue.put((current, total, message))
+        progress_cb = progress_callback_for(progress_queue, log_func)
 
         def error_cb(name, message):
             log_func(f"Failed: {name}: {message}", is_error=True)
@@ -239,8 +271,7 @@ def build_dedup_view(
         begin_job(state, cancel_btn)
         page.update()
 
-        def progress_cb(current, total, message):
-            progress_queue.put((current, total, message))
+        progress_cb = progress_callback_for(progress_queue, log_func)
 
         def error_cb(name, message):
             log_func(f"Failed: {name}: {message}", is_error=True)
@@ -271,12 +302,11 @@ def build_dedup_view(
             return
 
         scan_dir = d_state["scan_dir"]
-        log_func("Looking for the latest duplicate manifest...")
+        log_func("Looking for the latest duplicate manifest...", level="scan")
         begin_job(state, cancel_btn)
         page.update()
 
-        def progress_cb(current, total, message):
-            progress_queue.put((current, total, message))
+        progress_cb = progress_callback_for(progress_queue, log_func)
 
         def run():
             result: dict = {}
@@ -329,9 +359,7 @@ def build_dedup_view(
                                 ft.IconButton(
                                     ft.Icons.FOLDER_OPEN,
                                     tooltip="Open Folder",
-                                    on_click=lambda e: open_folder(
-                                        d_state["scan_dir"]
-                                    ),
+                                    on_click=d_open_folder,
                                 ),
                             ]
                         ),

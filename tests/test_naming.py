@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import struct
 import tempfile
 import unittest
 from datetime import datetime
@@ -11,10 +12,38 @@ from pathlib import Path
 from core.naming import (
     build_target_name,
     date_for_path,
+    date_with_source,
     get_target_path,
     parse_datetime_from_name,
+    read_exif_datetime,
     strip_generated_prefix,
 )
+
+
+def _jpeg_with_exif_date(date_text: str = "2023:04:05 06:07:08") -> bytes:
+    """Build a tiny little-endian TIFF/EXIF block inside a JPEG APP1 segment."""
+    ascii_value = date_text.encode("ascii") + b"\x00"
+    exif_ifd_offset = 8 + 18  # IFD0: count + one entry + next-IFD pointer
+    value_offset = exif_ifd_offset + 18  # Exif IFD size
+
+    tiff = b"II" + struct.pack("<H", 42) + struct.pack("<I", 8)
+    tiff += struct.pack("<H", 1)
+    tiff += struct.pack("<HHI", 0x8769, 4, 1) + struct.pack("<I", exif_ifd_offset)
+    tiff += struct.pack("<I", 0)
+    tiff += struct.pack("<H", 1)
+    tiff += struct.pack("<HHI", 0x9003, 2, len(ascii_value))
+    tiff += struct.pack("<I", value_offset)
+    tiff += struct.pack("<I", 0)
+    tiff += ascii_value
+
+    payload = b"Exif\x00\x00" + tiff
+    return (
+        b"\xff\xd8"
+        + b"\xff\xe1"
+        + struct.pack(">H", len(payload) + 2)
+        + payload
+        + b"\xff\xd9"
+    )
 
 
 class NamingTests(unittest.TestCase):
@@ -110,6 +139,39 @@ class NamingTests(unittest.TestCase):
                 date_for_path(path),
                 datetime.fromtimestamp(timestamp),
             )
+
+    def test_exif_datetime_is_read_and_counted(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "holiday.jpg"
+            path.write_bytes(_jpeg_with_exif_date("2023:04:05 06:07:08"))
+
+            self.assertEqual(
+                read_exif_datetime(path),
+                datetime(2023, 4, 5, 6, 7, 8),
+            )
+            date_obj, source = date_with_source(path)
+            self.assertEqual(date_obj, datetime(2023, 4, 5, 6, 7, 8))
+            self.assertEqual(source, "exif")
+
+    def test_filename_still_wins_over_exif(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "IMG_20240101_120000.jpg"
+            path.write_bytes(_jpeg_with_exif_date("2023:04:05 06:07:08"))
+
+            date_obj, source = date_with_source(path)
+            self.assertEqual(date_obj, datetime(2024, 1, 1, 12, 0, 0))
+            self.assertEqual(source, "filename")
+
+    def test_date_with_source_falls_back_to_mtime(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "holiday.png"
+            path.write_bytes(b"not an image")
+            timestamp = 1_700_000_000
+            os.utime(path, (timestamp, timestamp))
+
+            date_obj, source = date_with_source(path)
+            self.assertEqual(date_obj, datetime.fromtimestamp(timestamp))
+            self.assertEqual(source, "mtime")
 
 
 if __name__ == "__main__":

@@ -13,6 +13,25 @@ from pathlib import Path
 
 from core import fileops
 from core.constants import DUP_PREFIX
+from core.telemetry import (
+    KIND_LOG,
+    KIND_PHASE,
+    KIND_PROGRESS,
+    KIND_SUMMARY,
+    LEVEL_ERROR,
+    LEVEL_SUCCESS,
+    LEVEL_WARNING,
+    PHASE_DONE,
+    PHASE_HASH,
+    PHASE_MOVE,
+    PHASE_SCAN,
+    PHASE_UNDO,
+    ProgressEmitter,
+    empty_date_sources,
+    empty_detected,
+    iso_now,
+    with_timings,
+)
 
 __all__ = [
     "get_file_hash",
@@ -109,18 +128,49 @@ def run_dedup(
     so :func:`undo_dedup` can put them back.
     """
     start_time = time.time()
+    started_at = iso_now()
+    emitter = ProgressEmitter(progress_callback)
+    detected = empty_detected()
+
+    def _finalize(data: dict) -> dict:
+        data.setdefault("detected", detected)
+        data.setdefault("date_sources", empty_date_sources())
+        return with_timings(data, started_at, start_time)
+
     scan_path = Path(scan_dir)
     if not scan_path.exists() or not scan_path.is_dir():
-        return {"error": "Invalid folder."}
+        return _finalize({"error": "Invalid folder."})
 
     errors = 0
     error_details: list[str] = []
 
-    progress_callback(0, 0, "Scanning files...")
+    emitter.emit(
+        PHASE_SCAN,
+        f"Scanning {scan_path}...",
+        kind=KIND_PHASE,
+        indeterminate=True,
+        level=LEVEL_WARNING,
+    )
     records = _walk_files(scan_path, error_details, error_callback)
     total_files = len(records)
+    detected.update(
+        {
+            "total": total_files,
+            "zips": 0,
+            "loose": total_files,
+            "folders": 1,
+        }
+    )
+    emitter.emit(
+        PHASE_SCAN,
+        f"Discovered {total_files} file(s) to inspect.",
+        kind=KIND_LOG,
+        indeterminate=True,
+        level=LEVEL_WARNING,
+        metrics={"total": total_files},
+    )
     if total_files == 0:
-        return {
+        result = _finalize({
             "processed": 0,
             "groups": 0,
             "duplicates": 0,
@@ -132,7 +182,15 @@ def run_dedup(
             "dry_run": dry_run,
             "manifest": None,
             "time": _format_duration(time.time() - start_time),
-        }
+        })
+        emitter.emit(
+            PHASE_DONE,
+            "Duplicate scan finished: no files were found.",
+            kind=KIND_SUMMARY,
+            level=LEVEL_SUCCESS,
+            metrics={"processed": 0},
+        )
+        return result
 
     by_size: dict[int, list[tuple[Path, int, int]]] = defaultdict(list)
     for record in records:
@@ -141,7 +199,7 @@ def run_dedup(
     size_groups = [group for group in by_size.values() if len(group) > 1]
     total_to_hash = sum(len(group) for group in size_groups)
     if total_to_hash == 0:
-        return {
+        result = _finalize({
             "processed": total_files,
             "groups": 0,
             "duplicates": 0,
@@ -153,7 +211,15 @@ def run_dedup(
             "dry_run": dry_run,
             "manifest": None,
             "time": _format_duration(time.time() - start_time),
-        }
+        })
+        emitter.emit(
+            PHASE_DONE,
+            "Duplicate scan finished: no same-size candidates.",
+            kind=KIND_SUMMARY,
+            level=LEVEL_SUCCESS,
+            metrics={"processed": total_files},
+        )
+        return result
 
     # Stage 1: cheap head/tail hash inside same-size groups.
     quick_groups: dict[tuple[int, str], list[tuple[Path, int, int]]] = defaultdict(list)
@@ -161,7 +227,7 @@ def run_dedup(
     for group in size_groups:
         for record in group:
             if cancel_event.is_set():
-                return {
+                return _finalize({
                     "processed": total_files,
                     "groups": 0,
                     "duplicates": 0,
@@ -173,12 +239,17 @@ def run_dedup(
                     "dry_run": dry_run,
                     "manifest": None,
                     "time": _format_duration(time.time() - start_time),
-                }
+                })
             hashed += 1
-            progress_callback(
-                hashed,
-                total_to_hash,
+            emitter.emit(
+                PHASE_HASH,
                 f"Quick check {record[0].name}...",
+                kind=KIND_PROGRESS,
+                current=hashed,
+                total=total_to_hash,
+                indeterminate=False,
+                level=LEVEL_WARNING,
+                metrics={"filename": record[0].name, "stage": "quick"},
             )
             try:
                 quick = _quick_hash(record[0])
@@ -193,7 +264,7 @@ def run_dedup(
 
     candidates = [group for group in quick_groups.values() if len(group) > 1]
     if not candidates:
-        return {
+        result = _finalize({
             "processed": total_files,
             "groups": 0,
             "duplicates": 0,
@@ -205,7 +276,15 @@ def run_dedup(
             "dry_run": dry_run,
             "manifest": None,
             "time": _format_duration(time.time() - start_time),
-        }
+        })
+        emitter.emit(
+            PHASE_DONE,
+            "Duplicate scan finished: no duplicates found.",
+            kind=KIND_SUMMARY,
+            level=LEVEL_SUCCESS,
+            metrics={"processed": total_files},
+        )
+        return result
 
     # Stage 2: full content hash for the remaining candidates.
     full_groups: dict[tuple[int, str], list[tuple[Path, int, int]]] = defaultdict(list)
@@ -214,7 +293,7 @@ def run_dedup(
     for group in candidates:
         for record in group:
             if cancel_event.is_set():
-                return {
+                return _finalize({
                     "processed": total_files,
                     "groups": 0,
                     "duplicates": 0,
@@ -226,12 +305,17 @@ def run_dedup(
                     "dry_run": dry_run,
                     "manifest": None,
                     "time": _format_duration(time.time() - start_time),
-                }
+                })
             hashed += 1
-            progress_callback(
-                hashed,
-                total_to_hash,
+            emitter.emit(
+                PHASE_HASH,
                 f"Hashing {record[0].name}...",
+                kind=KIND_PROGRESS,
+                current=hashed,
+                total=total_to_hash,
+                indeterminate=False,
+                level=LEVEL_WARNING,
+                metrics={"filename": record[0].name, "stage": "full"},
             )
             try:
                 digest = get_file_hash(record[0])
@@ -268,8 +352,24 @@ def run_dedup(
 
     serialized = _serialize_groups(duplicate_groups)
 
+    # Exact byte count is always reported before anything is moved.
+    emitter.emit(
+        PHASE_MOVE,
+        f"Found {duplicate_count} duplicate file(s) in "
+        f"{len(duplicate_groups)} group(s), {duplicate_bytes} bytes "
+        f"({fileops.human_size(duplicate_bytes)}).",
+        kind=KIND_LOG,
+        level=LEVEL_WARNING,
+        metrics={
+            "groups": len(duplicate_groups),
+            "duplicates": duplicate_count,
+            "bytes": duplicate_bytes,
+            "human_bytes": fileops.human_size(duplicate_bytes),
+        },
+    )
+
     if dry_run or duplicate_count == 0:
-        return {
+        result = _finalize({
             "processed": total_files,
             "groups": len(duplicate_groups),
             "duplicates": duplicate_count,
@@ -282,7 +382,24 @@ def run_dedup(
             "manifest": None,
             "group_details": serialized,
             "time": _format_duration(time.time() - start_time),
-        }
+        })
+        emitter.emit(
+            PHASE_DONE,
+            (
+                f"Duplicate preview complete: {duplicate_count} duplicate(s), "
+                f"{fileops.human_size(duplicate_bytes)}."
+                if dry_run
+                else "Duplicate scan complete: nothing to move."
+            ),
+            kind=KIND_SUMMARY,
+            level=LEVEL_SUCCESS,
+            metrics={
+                "duplicates": duplicate_count,
+                "groups": len(duplicate_groups),
+                "bytes": duplicate_bytes,
+            },
+        )
+        return result
 
     duplicate_dir = fileops.unique_path(scan_path / f"{DUP_PREFIX}{int(time.time())}")
     planned_entries: list[dict] = []
@@ -307,6 +424,19 @@ def run_dedup(
                 }
             )
 
+    emitter.emit(
+        PHASE_MOVE,
+        f"Moving {duplicate_count} duplicate file(s), {duplicate_bytes} bytes, "
+        f"to {duplicate_dir.name}...",
+        kind=KIND_LOG,
+        level=LEVEL_WARNING,
+        metrics={
+            "duplicates": duplicate_count,
+            "bytes": duplicate_bytes,
+            "destination": str(duplicate_dir),
+        },
+    )
+
     manifest_path: Path | None = None
     if planned_entries:
         manifest_path = duplicate_dir / "_manifest.json"
@@ -314,7 +444,7 @@ def run_dedup(
             # Write the manifest *before* touching any file.  If the process
             # dies halfway through the moves, undo can still discover exactly
             # which files were intended to move and restore the ones that
-            # actually made it.
+            # actually made it.  See core/fileops.py for the atomic write.
             fileops.atomic_write_json(
                 manifest_path,
                 {
@@ -326,7 +456,7 @@ def run_dedup(
             )
         except Exception as exc:  # noqa: BLE001 - never move without a manifest
             detail = f"manifest: {exc}"
-            return {
+            return _finalize({
                 "error": f"Cannot write duplicate manifest: {exc}",
                 "processed": total_files,
                 "groups": len(duplicate_groups),
@@ -340,7 +470,7 @@ def run_dedup(
                 "manifest": None,
                 "group_details": serialized,
                 "time": _format_duration(time.time() - start_time),
-            }
+            })
 
     moved = 0
     cancelled = False
@@ -356,10 +486,19 @@ def run_dedup(
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(duplicate), str(destination))
             moved += 1
-            progress_callback(
-                moved,
-                duplicate_count,
+            emitter.emit(
+                PHASE_MOVE,
                 f"Moved {duplicate.name}...",
+                kind=KIND_PROGRESS,
+                current=moved,
+                total=duplicate_count,
+                indeterminate=False,
+                level=LEVEL_WARNING,
+                metrics={
+                    "filename": duplicate.name,
+                    "size": entry.get("size", 0),
+                    "moved": moved,
+                },
             )
         except Exception as exc:  # noqa: BLE001 - report per-file failures
             errors += 1
@@ -368,7 +507,7 @@ def run_dedup(
             if error_callback:
                 error_callback(duplicate.name, str(exc))
 
-    return {
+    result = _finalize({
         "processed": total_files,
         "groups": len(duplicate_groups),
         "duplicates": duplicate_count,
@@ -379,9 +518,40 @@ def run_dedup(
         "cancelled": cancelled,
         "dry_run": False,
         "manifest": str(manifest_path) if manifest_path else None,
+        "duplicate_dir": str(duplicate_dir),
         "group_details": serialized,
         "time": _format_duration(time.time() - start_time),
-    }
+    })
+    if cancelled:
+        summary_level = LEVEL_WARNING
+        summary_message = f"Duplicate move cancelled after {moved} file(s)."
+    elif errors:
+        summary_level = LEVEL_ERROR
+        summary_message = (
+            f"Duplicate move finished with {errors} error(s): {moved} moved."
+        )
+    else:
+        summary_level = LEVEL_SUCCESS
+        summary_message = (
+            f"Duplicate move finished in {result['time']}: {moved} moved, "
+            f"{fileops.human_size(duplicate_bytes)} in duplicates."
+        )
+    emitter.emit(
+        PHASE_DONE,
+        summary_message,
+        kind=KIND_SUMMARY,
+        level=summary_level,
+        current=moved,
+        total=duplicate_count,
+        indeterminate=False,
+        metrics={
+            "moved": moved,
+            "duplicates": duplicate_count,
+            "bytes": duplicate_bytes,
+            "errors": len(error_details),
+        },
+    )
+    return result
 
 
 def find_latest_manifest(scan_dir: str) -> Path | None:
@@ -408,15 +578,24 @@ def undo_dedup(
 ) -> dict:
     """Move duplicates recorded in a manifest back to their original paths."""
     start_time = time.time()
+    started_at = iso_now()
+    emitter = ProgressEmitter(progress_callback)
+
+    def _finalize(data: dict) -> dict:
+        data.setdefault("detected", empty_detected())
+        data.setdefault("date_sources", empty_date_sources())
+        return with_timings(data, started_at, start_time)
+
     manifest = Path(manifest_path) if manifest_path else find_latest_manifest(scan_dir)
     if manifest is None or not manifest.exists():
-        return {"error": "No duplicate-finder manifest was found to undo."}
+        return _finalize({"error": "No duplicate-finder manifest was found to undo."})
 
     try:
+        # Read-only manifest access; writes elsewhere use core/fileops.py.
         with open(manifest, "r", encoding="utf-8") as handle:
             data = json.load(handle)
     except (OSError, json.JSONDecodeError) as exc:
-        return {"error": f"Cannot read manifest: {exc}"}
+        return _finalize({"error": f"Cannot read manifest: {exc}"})
 
     entries = data.get("entries", []) if isinstance(data, dict) else []
     if not isinstance(entries, list):
@@ -428,6 +607,16 @@ def undo_dedup(
     error_details: list[str] = []
     cancelled = False
 
+    emitter.emit(
+        PHASE_UNDO,
+        f"Restoring {total} file(s) from the duplicate manifest...",
+        kind=KIND_PHASE,
+        current=0,
+        total=total,
+        indeterminate=total == 0,
+        level=LEVEL_WARNING,
+    )
+
     for index, entry in enumerate(entries, start=1):
         if cancel_event.is_set():
             cancelled = True
@@ -436,10 +625,15 @@ def undo_dedup(
             errors += 1
             error_details.append(f"entry {index}: malformed manifest entry")
             continue
-        progress_callback(
-            index - 1,
-            total,
+        emitter.emit(
+            PHASE_UNDO,
             f"Restoring {Path(entry.get('original', '')).name}...",
+            kind=KIND_PROGRESS,
+            current=index - 1,
+            total=total,
+            indeterminate=False,
+            level=LEVEL_WARNING,
+            metrics={"filename": Path(entry.get("original", "")).name},
         )
         try:
             original = Path(entry["original"])
@@ -458,7 +652,7 @@ def undo_dedup(
             errors += 1
             error_details.append(f"{entry.get('original', '?')}: {exc}")
 
-    return {
+    result = _finalize({
         "manifest": str(manifest),
         "total": total,
         "restored": restored,
@@ -466,5 +660,34 @@ def undo_dedup(
         "errors": errors,
         "error_details": error_details[:100],
         "cancelled": cancelled,
+        "detected": {
+            "total": total,
+            "zips": 0,
+            "loose": 0,
+            "folders": 0,
+        },
         "time": _format_duration(time.time() - start_time),
-    }
+    })
+    if cancelled:
+        summary_level = LEVEL_WARNING
+        summary_message = f"Undo cancelled after restoring {restored} file(s)."
+    elif errors:
+        summary_level = LEVEL_ERROR
+        summary_message = f"Undo finished with {errors} error(s): {restored} restored."
+    else:
+        summary_level = LEVEL_SUCCESS
+        summary_message = (
+            f"Undo finished in {result['time']}: {restored} restored, "
+            f"{skipped} skipped."
+        )
+    emitter.emit(
+        PHASE_DONE,
+        summary_message,
+        kind=KIND_SUMMARY,
+        level=summary_level,
+        current=restored,
+        total=total,
+        indeterminate=False,
+        metrics={"restored": restored, "skipped": skipped, "errors": errors},
+    )
+    return result

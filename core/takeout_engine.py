@@ -18,11 +18,29 @@ from pathlib import Path
 from core import fileops
 from core.constants import IMAGE_EXT, MEDIA_EXT, VIDEO_EXT
 from core.naming import (
-    date_for_path,
+    date_with_source,
     parse_datetime_from_name,
 )
 from core.naming import (
     get_target_path as build_target_path,
+)
+from core.telemetry import (
+    KIND_LOG,
+    KIND_PHASE,
+    KIND_SUMMARY,
+    LEVEL_ERROR,
+    LEVEL_ORGANIZE,
+    LEVEL_SUCCESS,
+    LEVEL_WARNING,
+    PHASE_DONE,
+    PHASE_ORGANIZE,
+    PHASE_SCAN,
+    ProgressEmitter,
+    date_sources_label,
+    empty_date_sources,
+    empty_detected,
+    iso_now,
+    with_timings,
 )
 
 __all__ = [
@@ -208,6 +226,17 @@ def run_takeout(
 ) -> dict:
     """Organise loose media files and/or ZIP archives into the destination."""
     start_time = time.time()
+    started_at = iso_now()
+    emitter = ProgressEmitter(progress_callback)
+    date_sources = empty_date_sources()
+    detected = empty_detected()
+    bytes_copied = 0
+
+    def _finalize(data: dict) -> dict:
+        data.setdefault("detected", detected)
+        data.setdefault("date_sources", date_sources)
+        return with_timings(data, started_at, start_time)
+
     if isinstance(input_items, (str, Path)):
         input_items = [input_items]
     input_items = [Path(item) for item in input_items or []]
@@ -217,7 +246,7 @@ def run_takeout(
         dest_root.mkdir(parents=True, exist_ok=True)
         dest_resolved = dest_root.resolve()
     except OSError as exc:
-        return {
+        return _finalize({
             "error": f"Cannot create destination folder: {exc}",
             "total": 0,
             "processed": 0,
@@ -226,7 +255,7 @@ def run_takeout(
             "error_details": [],
             "cancelled": False,
             "time": _format_duration(0),
-        }
+        })
 
     loose_files: list[Path] = []
     zips: list[Path] = []
@@ -248,11 +277,18 @@ def run_takeout(
             seen_zips.add(key)
             zips.append(path)
 
-    progress_callback(0, 0, "Scanning folders and ZIPs...")
+    emitter.emit(
+        PHASE_SCAN,
+        "Scanning folders and ZIPs...",
+        kind=KIND_PHASE,
+        indeterminate=True,
+        level=LEVEL_WARNING,
+    )
 
+    folder_count = 0
     for item in input_items:
         if cancel_event.is_set():
-            return {
+            return _finalize({
                 "total": 0,
                 "processed": 0,
                 "skipped": 0,
@@ -260,9 +296,10 @@ def run_takeout(
                 "error_details": [],
                 "cancelled": True,
                 "time": _format_duration(time.time() - start_time),
-            }
+            })
 
         if item.is_dir():
+            folder_count += 1
             for root, dirs, files in os.walk(item):
                 root_path = Path(root).resolve()
                 if root_path == dest_resolved:
@@ -286,6 +323,20 @@ def run_takeout(
             elif _matches_filter(suffix, media_filter):
                 add_loose(item)
 
+    emitter.emit(
+        PHASE_SCAN,
+        f"Scanning {folder_count} folders... Found {len(zips)} ZIP files and "
+        f"{len(loose_files)} loose files.",
+        kind=KIND_LOG,
+        indeterminate=True,
+        level=LEVEL_WARNING,
+        metrics={
+            "folders": folder_count,
+            "zips": len(zips),
+            "loose": len(loose_files),
+        },
+    )
+
     # Read the ZIP central directories once to build a reliable total.
     zip_members: list[tuple[Path, str, int]] = []
     for zip_path in zips:
@@ -305,8 +356,31 @@ def run_takeout(
                 error_callback(zip_path.name, str(exc))
 
     total_files = len(loose_files) + len(zip_members)
+    detected.update(
+        {
+            "total": total_files,
+            "zips": len(zips),
+            "loose": len(loose_files),
+            "folders": folder_count,
+            "zip_members": len(zip_members),
+        }
+    )
+    emitter.emit(
+        PHASE_SCAN,
+        f"Read {len(zips)} ZIP archives: {len(zip_members)} media entries.",
+        kind=KIND_LOG,
+        indeterminate=True,
+        level=LEVEL_WARNING,
+        metrics={
+            "folders": folder_count,
+            "zips": len(zips),
+            "loose": len(loose_files),
+            "zip_members": len(zip_members),
+        },
+    )
+
     if total_files == 0:
-        return {
+        result = _finalize({
             "total": 0,
             "processed": 0,
             "skipped": 0,
@@ -315,7 +389,15 @@ def run_takeout(
             "warnings": warnings,
             "cancelled": False,
             "time": _format_duration(time.time() - start_time),
-        }
+        })
+        emitter.emit(
+            PHASE_DONE,
+            "Organizer finished: no matching media or ZIP files were found.",
+            kind=KIND_SUMMARY,
+            level=LEVEL_SUCCESS,
+            metrics={"processed": 0, "errors": errors},
+        )
+        return result
 
     total_bytes = sum(info_size for _, _, info_size in zip_members)
     for path in loose_files:
@@ -326,7 +408,7 @@ def run_takeout(
     try:
         free_bytes = shutil.disk_usage(dest_root).free
         if total_bytes > free_bytes:
-            return {
+            return _finalize({
                 "error": (
                     "Not enough free space at the destination. "
                     f"Need about {total_bytes / (1024 ** 3):.1f} GB, "
@@ -339,7 +421,7 @@ def run_takeout(
                 "error_details": error_details[:100],
                 "cancelled": False,
                 "time": _format_duration(time.time() - start_time),
-            }
+            })
     except OSError:
         pass
 
@@ -352,25 +434,46 @@ def run_takeout(
     # ------------------------------------------------------------------
     # Loose files
     # ------------------------------------------------------------------
+    emitter.emit(
+        PHASE_ORGANIZE,
+        f"Organizing {total_files} files...",
+        kind=KIND_PHASE,
+        current=0,
+        total=total_files,
+        indeterminate=False,
+        level=LEVEL_ORGANIZE,
+    )
+
     for source_file in loose_files:
         if cancel_event.is_set():
             cancelled = True
             break
 
         done += 1
-        progress_callback(
-            done - 1,
-            total_files,
-            f"Organizing {source_file.name}...",
+        speed = bytes_copied / emitter.elapsed if emitter.elapsed > 0 else 0.0
+        emitter.emit(
+            PHASE_ORGANIZE,
+            f"Organizing {source_file.name}... ({fileops.human_size(speed)}/s)",
+            kind="progress",
+            current=done - 1,
+            total=total_files,
+            indeterminate=False,
+            level=LEVEL_ORGANIZE,
+            metrics={
+                "filename": source_file.name,
+                "bytes_done": bytes_copied,
+                "speed_bytes_per_sec": round(speed, 1),
+            },
         )
         try:
             source_stat = source_file.stat()
             sidecar = _find_sidecar(source_file)
             date_obj = get_date_from_json(sidecar) if sidecar else None
-            if date_obj is None:
-                date_obj = parse_datetime_from_name(source_file.stem)
-            if date_obj is None:
-                date_obj = date_for_path(source_file, source_stat)
+            if date_obj is not None:
+                date_source = "json"
+            else:
+                date_obj, date_source = date_with_source(source_file, source_stat)
+            date_sources[date_source] = date_sources.get(date_source, 0) + 1
 
             target_file = build_target_path(
                 source_file, dest_root, sort_mode, date_obj
@@ -386,12 +489,14 @@ def run_takeout(
             if should_skip:
                 skipped += 1
             else:
+                # Crash-safe verified copy; see core/fileops.py.
                 fileops.copy_file_atomic(
                     source_file,
                     target_file,
                     preserve_mtime=True,
                 )
                 processed += 1
+                bytes_copied += source_stat.st_size
             written_targets.add(target_file)
 
             if preserve_metadata and sidecar is not None:
@@ -410,7 +515,21 @@ def run_takeout(
             if error_callback:
                 error_callback(source_file.name, str(exc))
 
-        progress_callback(done, total_files, f"Processed {done} / {total_files}")
+        emitter.emit(
+            PHASE_ORGANIZE,
+            f"Processed {done} / {total_files}",
+            kind="progress",
+            current=done,
+            total=total_files,
+            indeterminate=False,
+            level=LEVEL_ORGANIZE,
+            metrics={
+                "processed": processed,
+                "skipped": skipped,
+                "errors": errors,
+                "bytes_done": bytes_copied,
+            },
+        )
 
     # ------------------------------------------------------------------
     # ZIP archives (streamed, never extracted)
@@ -446,10 +565,21 @@ def run_takeout(
                 continue
 
             done += 1
-            progress_callback(
-                done - 1,
-                total_files,
-                f"Organizing {Path(member_name).name}...",
+            speed = bytes_copied / emitter.elapsed if emitter.elapsed > 0 else 0.0
+            emitter.emit(
+                PHASE_ORGANIZE,
+                f"Organizing {Path(member_name).name}... "
+                f"({fileops.human_size(speed)}/s)",
+                kind="progress",
+                current=done - 1,
+                total=total_files,
+                indeterminate=False,
+                level=LEVEL_ORGANIZE,
+                metrics={
+                    "filename": Path(member_name).name,
+                    "bytes_done": bytes_copied,
+                    "speed_bytes_per_sec": round(speed, 1),
+                },
             )
 
             try:
@@ -466,10 +596,16 @@ def run_takeout(
                         date_obj = None
 
                 member_path = Path(member_name.replace("\\", "/"))
-                if date_obj is None:
+                if date_obj is not None:
+                    date_source = "json"
+                else:
                     date_obj = parse_datetime_from_name(member_path.stem)
-                if date_obj is None:
-                    date_obj = datetime(*info.date_time)
+                    if date_obj is not None:
+                        date_source = "filename"
+                    else:
+                        date_obj = datetime(*info.date_time)
+                        date_source = "mtime"
+                date_sources[date_source] = date_sources.get(date_source, 0) + 1
 
                 mtime_ns = _zip_mtime_ns(info)
                 target_file = build_target_path(
@@ -487,6 +623,7 @@ def run_takeout(
                     skipped += 1
                 else:
                     with archive.open(info) as stream:
+                        # Crash-safe verified stream copy; see core/fileops.py.
                         fileops.copy_stream_atomic(
                             stream,
                             target_file,
@@ -494,6 +631,7 @@ def run_takeout(
                             mtime_ns=mtime_ns,
                         )
                     processed += 1
+                    bytes_copied += info.file_size
                 written_targets.add(target_file)
 
                 if preserve_metadata and sidecar_name is not None:
@@ -513,12 +651,49 @@ def run_takeout(
                 if error_callback:
                     error_callback(Path(member_name).name, str(exc))
 
-            progress_callback(done, total_files, f"Processed {done} / {total_files}")
+            emitter.emit(
+                PHASE_ORGANIZE,
+                f"Processed {done} / {total_files}",
+                kind="progress",
+                current=done,
+                total=total_files,
+                indeterminate=False,
+                level=LEVEL_ORGANIZE,
+                metrics={
+                    "processed": processed,
+                    "skipped": skipped,
+                    "errors": errors,
+                    "bytes_done": bytes_copied,
+                },
+            )
     finally:
         if archive is not None:
             archive.close()
 
-    return {
+    emitter.emit(
+        PHASE_ORGANIZE,
+        f"Extracted dates: {date_sources_label(date_sources)}.",
+        kind=KIND_LOG,
+        level=LEVEL_ORGANIZE,
+        metrics={"date_sources": date_sources},
+    )
+    emitter.emit(
+        PHASE_ORGANIZE,
+        f"Skipped {skipped} files (already exist).",
+        kind=KIND_LOG,
+        level=LEVEL_ORGANIZE,
+        metrics={"skipped": skipped},
+    )
+    emitter.emit(
+        PHASE_ORGANIZE,
+        f"Renamed/Organized {processed} new files.",
+        kind=KIND_LOG,
+        level=LEVEL_ORGANIZE,
+        metrics={"processed": processed},
+    )
+
+    elapsed = time.time() - start_time
+    result = _finalize({
         "total": total_files,
         "processed": processed,
         "skipped": skipped,
@@ -526,5 +701,38 @@ def run_takeout(
         "error_details": error_details[:100],
         "warnings": warnings,
         "cancelled": cancelled,
-        "time": _format_duration(time.time() - start_time),
-    }
+        "total_bytes": total_bytes,
+        "bytes_copied": bytes_copied,
+        "time": _format_duration(elapsed),
+    })
+    if cancelled:
+        summary_level = LEVEL_WARNING
+        summary_message = "Organizer cancelled."
+    elif errors:
+        summary_level = LEVEL_ERROR
+        summary_message = (
+            f"Organizer finished with {errors} error(s) in {result['time']}."
+        )
+    else:
+        summary_level = LEVEL_SUCCESS
+        summary_message = (
+            f"Organizer finished in {result['time']}: "
+            f"{processed} organized, {skipped} skipped, {errors} errors."
+        )
+    emitter.emit(
+        PHASE_DONE,
+        summary_message,
+        kind=KIND_SUMMARY,
+        level=summary_level,
+        current=processed,
+        total=total_files,
+        indeterminate=False,
+        metrics={
+            "processed": processed,
+            "skipped": skipped,
+            "errors": errors,
+            "bytes_copied": bytes_copied,
+            "date_sources": date_sources,
+        },
+    )
+    return result

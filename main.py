@@ -13,13 +13,18 @@ from pathlib import Path
 
 import flet as ft
 
+from core.cli import sanitize_argv
 from core.constants import APP_NAME, VERSION
 from core.logging_setup import setup_logging
 from core.storage import load_global_settings, save_global_settings
-from views.common import open_folder
+from views.common import level_color, open_folder, show_snack
 from views.dedup_view import build_dedup_view
 from views.organizer_view import build_organizer_view
 from views.phone_view import build_phone_view
+
+# AppImages forward literal %U/%F field codes as arguments; strip them before
+# Flet or any folder-opening code can see them.
+sys.argv[:] = sanitize_argv(sys.argv)
 
 
 def _play_ding() -> None:
@@ -90,16 +95,16 @@ def main(page: ft.Page) -> None:
         if not state["shutdown_event"].is_set():
             ui_queue.put(callback)
 
-    def log(message: str, is_error: bool = False) -> None:
+    def log(message: str, is_error: bool = False, level: str | None = None) -> None:
         if state["shutdown_event"].is_set():
             return
-        if is_error:
+        log_level = "error" if is_error else (level or "info")
+        if is_error or log_level == "error":
             logger.error(message)
         else:
             logger.info(message)
 
         timestamp = datetime.now().strftime("%H:%M:%S")
-        color = ft.Colors.RED_400 if is_error else ft.Colors.ON_SURFACE
 
         def append_log() -> None:
             log_col.controls.append(
@@ -107,22 +112,54 @@ def main(page: ft.Page) -> None:
                     f"[{timestamp}] {message}",
                     size=13,
                     font_family="monospace",
-                    color=color,
+                    color=level_color(
+                        log_level,
+                        page.theme_mode != ft.ThemeMode.LIGHT,
+                    ),
                 )
             )
             while len(log_col.controls) > 800:
                 log_col.controls.pop(0)
+            log_col.auto_scroll = True
 
         post_ui(append_log)
 
     progress_text = ft.Text(
         "",
-        size=16,
+        size=13,
         weight=ft.FontWeight.BOLD,
-        color=ft.Colors.GREEN_400,
+        color=ft.Colors.ON_SURFACE,
         font_family="monospace",
     )
-    log_col = ft.Column(spacing=4, scroll=ft.ScrollMode.AUTO, expand=True)
+    phase_text = ft.Text(
+        "",
+        size=14,
+        weight=ft.FontWeight.BOLD,
+        color=ft.Colors.ON_SURFACE,
+    )
+    progress_ring = ft.ProgressRing(
+        width=24,
+        height=24,
+        stroke_width=3,
+        color=ft.Colors.BLUE_300,
+        visible=False,
+    )
+    progress_bar = ft.ProgressBar(
+        value=0,
+        color=ft.Colors.BLUE_300,
+        bgcolor=ft.Colors.OUTLINE_VARIANT,
+        visible=False,
+        expand=True,
+    )
+    progress_host = ft.Container(
+        content=ft.Row(
+            [progress_ring, progress_bar],
+            spacing=10,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        ),
+        height=30,
+    )
+    log_col = ft.Column(spacing=4, scroll=ft.ScrollMode.AUTO, expand=True, auto_scroll=True)
 
     def clear_log(event) -> None:
         log_col.controls.clear()
@@ -174,6 +211,14 @@ def main(page: ft.Page) -> None:
         bgcolor=ft.Colors.BLUE_700,
     )
 
+    def open_log_folder(event=None) -> None:
+        def _on_error(message: str) -> None:
+            log(message, is_error=True, level="error")
+            show_snack(page, message, is_error=True)
+
+        if open_folder(log_dir, on_error=_on_error):
+            show_snack(page, "Opened log folder")
+
     log_header = ft.Row(
         [
             ft.Text("Activity log", size=13, color=ft.Colors.ON_SURFACE),
@@ -188,7 +233,7 @@ def main(page: ft.Page) -> None:
                 ft.Icons.FOLDER_OPEN,
                 tooltip="Open log folder",
                 icon_size=18,
-                on_click=lambda e: open_folder(log_dir),
+                on_click=open_log_folder,
             ),
         ]
     )
@@ -202,7 +247,9 @@ def main(page: ft.Page) -> None:
                     size=16,
                     color=ft.Colors.ON_SURFACE,
                 ),
-                ft.Container(content=progress_text, height=30),
+                ft.Container(content=phase_text, height=24),
+                progress_host,
+                ft.Container(content=progress_text, height=24),
                 ft.Divider(color=ft.Colors.OUTLINE_VARIANT),
                 log_header,
                 ft.Container(
@@ -248,29 +295,121 @@ def main(page: ft.Page) -> None:
             except Exception:  # noqa: BLE001 - page may be closing
                 pass
 
+    def _unpack_progress(item):
+        """Accept legacy 3-tuples and the new 4-tuple telemetry shape."""
+        if isinstance(item, (tuple, list)):
+            if len(item) >= 4:
+                event = item[3] if isinstance(item[3], dict) else None
+                return item[0], item[1], item[2], event
+            if len(item) == 3:
+                return item[0], item[1], item[2], None
+        return 0, 0, "", None
+
+    def _reset_progress() -> None:
+        phase_text.value = "Idle"
+        progress_text.value = ""
+        progress_ring.visible = False
+        progress_bar.visible = False
+        progress_bar.value = 0
+
+    def _apply_progress(current, total, message, event) -> None:
+        if not message and not event:
+            _reset_progress()
+            return
+
+        event = event or {}
+        kind = event.get("kind", "progress")
+        phase = event.get("phase")
+
+        if kind == "summary" or phase == "done":
+            phase_text.value = message or "Finished"
+            progress_ring.visible = False
+            progress_bar.visible = False
+            progress_bar.value = 1 if total and current >= total else progress_bar.value
+            progress_text.value = ""
+            return
+
+        if kind == "log":
+            if phase in {"scan", "state"}:
+                phase_text.value = message
+                progress_ring.visible = True
+                progress_bar.visible = False
+                progress_text.value = ""
+            return
+
+        if kind == "phase":
+            phase_text.value = message
+            if event.get("indeterminate", total <= 0):
+                progress_ring.visible = True
+                progress_bar.visible = False
+                progress_text.value = ""
+            else:
+                progress_ring.visible = False
+                progress_bar.visible = True
+                progress_bar.value = (
+                    min(max(current / total, 0.0), 1.0) if total > 0 else None
+                )
+                progress_text.value = (
+                    f"{current} / {total} ({progress_bar.value * 100:.1f}%)"
+                    if total > 0 and progress_bar.value is not None
+                    else ""
+                )
+            return
+
+        # Ordinary progress update.
+        if total > 0:
+            value = min(max(current / total, 0.0), 1.0)
+            progress_ring.visible = False
+            progress_bar.visible = True
+            progress_bar.value = value
+            phase_text.value = message
+            progress_text.value = f"{current} / {total} ({value * 100:.1f}%)"
+        else:
+            phase_text.value = message
+            progress_ring.visible = True
+            progress_bar.visible = False
+            progress_text.value = ""
+
     async def progress_consumer() -> None:
-        """Drain the progress queue, keeping only the latest update."""
+        """Apply telemetry on the Flet thread, latest progress wins."""
         while not state["shutdown_event"].is_set():
-            latest = None
+            items = []
             try:
-                while True:
-                    latest = progress_queue.get_nowait()
+                while len(items) < 200:
+                    items.append(progress_queue.get_nowait())
             except queue.Empty:
                 pass
 
-            if latest is not None:
-                current, total, message = latest
-                if total > 0:
-                    percent = (current / total) * 100
-                    progress_text.value = (
-                        f"Progress: {current} / {total} ({percent:.1f}%)"
-                    )
-                else:
-                    progress_text.value = message
-                try:
-                    progress_text.update()
-                except Exception:  # noqa: BLE001 - page may be closing
-                    pass
+            if not items:
+                await asyncio.sleep(0.15)
+                continue
+
+            latest_progress = None
+            for item in items:
+                current, total, message, event = _unpack_progress(item)
+                if not message and not event:
+                    latest_progress = None
+                    _reset_progress()
+                    continue
+                kind = (event or {}).get("kind", "progress")
+                if kind == "progress":
+                    latest_progress = (current, total, message, event)
+                    continue
+
+                # Flush the latest progress before a later control event so a
+                # "done" summary cannot be overwritten by stale progress.
+                if latest_progress is not None:
+                    _apply_progress(*latest_progress)
+                    latest_progress = None
+                _apply_progress(current, total, message, event)
+
+            if latest_progress is not None:
+                _apply_progress(*latest_progress)
+
+            try:
+                page.update()
+            except Exception:  # noqa: BLE001 - page may be closing
+                pass
 
             await asyncio.sleep(0.15)
 

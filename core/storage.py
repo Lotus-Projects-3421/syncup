@@ -211,6 +211,17 @@ class StateStore:
             for rel_path, size, mtime in rows
         }
 
+    def oldest_copied_at(self) -> str | None:
+        """Return the earliest recorded backup timestamp, if one exists."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MIN(copied_at) FROM processed WHERE copied_at IS NOT NULL"
+            ).fetchone()
+        if not row or not row[0]:
+            return None
+        return str(row[0])
+
+
     def mark(
         self,
         rel_path: str,

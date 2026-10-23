@@ -17,9 +17,29 @@ from pathlib import Path
 
 from core import fileops
 from core.constants import IMAGE_EXT, MEDIA_EXT, VIDEO_EXT
-from core.naming import date_for_path
+from core.naming import date_for_path, date_with_source
 from core.naming import get_target_path as build_target_path
 from core.storage import StateStore
+from core.telemetry import (
+    KIND_LOG,
+    KIND_PHASE,
+    KIND_SUMMARY,
+    LEVEL_ERROR,
+    LEVEL_ORGANIZE,
+    LEVEL_SUCCESS,
+    LEVEL_WARNING,
+    PHASE_DONE,
+    PHASE_ORGANIZE,
+    PHASE_SCAN,
+    PHASE_STATE,
+    PHASE_TRANSFER,
+    ProgressEmitter,
+    date_sources_label,
+    empty_date_sources,
+    empty_detected,
+    iso_now,
+    with_timings,
+)
 
 # Re-exported for backwards compatibility.
 __all__ = [
@@ -127,13 +147,24 @@ def run_backup(
     is present only for a fatal problem (device missing, no space, and so on).
     """
     start_time = time.time()
+    started_at = iso_now()
+    emitter = ProgressEmitter(progress_callback)
+    date_sources = empty_date_sources()
+    bytes_copied = 0
+    detected = empty_detected()
+
+    def _finalize(data: dict) -> dict:
+        data.setdefault("detected", detected)
+        data.setdefault("date_sources", date_sources)
+        return with_timings(data, started_at, start_time)
+
     phone_root = Path(phone_path) / "Internal shared storage"
     if not phone_root.exists():
         phone_root = Path(phone_path)
     dest_root = Path(dest_path)
 
     if not phone_root.exists():
-        return {
+        return _finalize({
             "error": f"Phone storage was not found at {phone_path}.",
             "total": 0,
             "processed": 0,
@@ -142,13 +173,13 @@ def run_backup(
             "error_details": [],
             "cancelled": False,
             "time": _format_duration(0),
-        }
+        })
 
     try:
         # Check before creating anything: writing a folder onto the phone just
         # to reject it is both slow and risky on MTP.
         if dest_root.resolve().is_relative_to(phone_root.resolve()):
-            return {
+            return _finalize({
                 "error": "The destination folder cannot be inside the phone storage.",
                 "total": 0,
                 "processed": 0,
@@ -157,14 +188,14 @@ def run_backup(
                 "error_details": [],
                 "cancelled": False,
                 "time": _format_duration(0),
-            }
+            })
     except (OSError, ValueError):
         pass
 
     try:
         dest_root.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        return {
+        return _finalize({
             "error": f"Cannot create destination folder: {exc}",
             "total": 0,
             "processed": 0,
@@ -173,7 +204,7 @@ def run_backup(
             "error_details": [],
             "cancelled": False,
             "time": _format_duration(0),
-        }
+        })
 
     root_folders = []
     for folder in selected_folders or []:
@@ -185,7 +216,7 @@ def run_backup(
             root_folders.append((relative, folder_path))
 
     if not root_folders:
-        return {
+        return _finalize({
             "error": "No readable folders were selected.",
             "total": 0,
             "processed": 0,
@@ -194,7 +225,7 @@ def run_backup(
             "error_details": [],
             "cancelled": False,
             "time": _format_duration(0),
-        }
+        })
 
     store = StateStore(phone_id)
     processed_files = store.load()
@@ -206,9 +237,17 @@ def run_backup(
     warnings: list[str] = []
     candidates: list[tuple[Path, str, os.stat_result]] = []
     total_bytes = 0
+    found_files = 0
 
     try:
-        progress_callback(0, 0, "Scanning for new files...")
+        emitter.emit(
+            PHASE_SCAN,
+            f"Scanning {len(root_folders)} folders...",
+            kind=KIND_PHASE,
+            indeterminate=True,
+            level=LEVEL_WARNING,
+            metrics={"folders": len(root_folders), "zips": 0, "loose": 0},
+        )
         seen_paths: set[str] = set()
 
         for relative, folder_path in root_folders:
@@ -229,6 +268,7 @@ def run_backup(
                 if rel_path in seen_paths:
                     continue
                 seen_paths.add(rel_path)
+                found_files += 1
                 if _is_processed(
                     processed_files.get(rel_path),
                     source_stat.st_size,
@@ -241,9 +281,51 @@ def run_backup(
                 total_bytes += source_stat.st_size
 
         total_files = len(candidates)
+        detected.update(
+            {
+                "total": found_files,
+                "zips": 0,
+                "loose": found_files,
+                "folders": len(root_folders),
+            }
+        )
+
+        emitter.emit(
+            PHASE_SCAN,
+            f"Scanning {len(root_folders)} folders... "
+            f"Found 0 ZIP files and {found_files} loose files.",
+            kind=KIND_LOG,
+            indeterminate=True,
+            level=LEVEL_WARNING,
+            metrics={
+                "folders": len(root_folders),
+                "zips": 0,
+                "loose": found_files,
+                "candidates": total_files,
+            },
+        )
+
+        oldest_backup = store.oldest_copied_at()
+        oldest_label = oldest_backup[:10] if oldest_backup else "none yet"
+        emitter.emit(
+            PHASE_STATE,
+            "Checking database... "
+            f"Found {len(processed_files)} previously backed-up files. "
+            f"(Oldest backup: {oldest_label}). "
+            f"{total_files} new files to process.",
+            kind=KIND_LOG,
+            indeterminate=True,
+            level=LEVEL_WARNING,
+            metrics={
+                "previously_backed_up": len(processed_files),
+                "oldest_backup": oldest_backup,
+                "new_files": total_files,
+                "skipped": skipped,
+            },
+        )
 
         if total_files == 0:
-            return {
+            result = _finalize({
                 "total": 0,
                 "processed": 0,
                 "skipped": skipped,
@@ -251,13 +333,26 @@ def run_backup(
                 "error_details": error_details[:100],
                 "warnings": warnings,
                 "cancelled": False,
+                "total_bytes": total_bytes,
+                "bytes_copied": 0,
+                "oldest_backup": oldest_backup,
                 "time": _format_duration(time.time() - start_time),
-            }
+            })
+            emitter.emit(
+                PHASE_DONE,
+                "Phone backup finished: nothing new to copy.",
+                kind=KIND_SUMMARY,
+                level=LEVEL_SUCCESS,
+                current=0,
+                total=0,
+                metrics={"processed": 0, "skipped": skipped, "errors": errors},
+            )
+            return result
 
         try:
             free_bytes = shutil.disk_usage(dest_root).free
             if total_bytes > free_bytes:
-                return {
+                return _finalize({
                     "error": (
                         "Not enough free space at the destination. "
                         f"Need {total_bytes / (1024 ** 3):.1f} GB, "
@@ -269,8 +364,11 @@ def run_backup(
                     "errors": errors,
                     "error_details": error_details[:100],
                     "cancelled": False,
+                    "total_bytes": total_bytes,
+                    "bytes_copied": 0,
+                    "oldest_backup": oldest_backup,
                     "time": _format_duration(time.time() - start_time),
-                }
+                })
         except OSError:
             pass
 
@@ -279,19 +377,40 @@ def run_backup(
         consecutive_errors = 0
         created_targets: set[Path] = set()
 
+        emitter.emit(
+            PHASE_TRANSFER,
+            f"Transferring {total_files} files...",
+            kind=KIND_PHASE,
+            current=0,
+            total=total_files,
+            indeterminate=False,
+            level=LEVEL_ORGANIZE,
+        )
+
         for index, (source_file, rel_path, source_stat) in enumerate(candidates, start=1):
             if cancel_event.is_set():
                 cancelled = True
                 break
 
-            progress_callback(
-                index - 1,
-                total_files,
-                f"Copying {source_file.name}...",
+            speed = bytes_copied / emitter.elapsed if emitter.elapsed > 0 else 0.0
+            emitter.emit(
+                PHASE_TRANSFER,
+                f"Copying {source_file.name}... ({fileops.human_size(speed)}/s)",
+                kind="progress",
+                current=index - 1,
+                total=total_files,
+                indeterminate=False,
+                level=LEVEL_ORGANIZE,
+                metrics={
+                    "filename": source_file.name,
+                    "bytes_done": bytes_copied,
+                    "speed_bytes_per_sec": round(speed, 1),
+                },
             )
 
             try:
-                date_obj = date_for_path(source_file, source_stat)
+                date_obj, date_source = date_with_source(source_file, source_stat)
+                date_sources[date_source] = date_sources.get(date_source, 0) + 1
                 target_file = build_target_path(
                     source_file, dest_root, sort_mode, date_obj
                 )
@@ -313,10 +432,15 @@ def run_backup(
                         created_targets.add(target_file)
                         skipped += 1
                         consecutive_errors = 0
-                        progress_callback(
-                            index,
-                            total_files,
+                        emitter.emit(
+                            PHASE_TRANSFER,
                             f"Already present: {source_file.name}",
+                            kind="progress",
+                            current=index,
+                            total=total_files,
+                            indeterminate=False,
+                            level=LEVEL_ORGANIZE,
+                            metrics={"filename": source_file.name, "skipped": skipped},
                         )
                         continue
 
@@ -329,6 +453,7 @@ def run_backup(
                     # copy_file_atomic replace the old file only after the new
                     # copy has been verified.
 
+                # Crash-safe verified copy; see core/fileops.py.
                 fileops.copy_file_atomic(
                     source_file,
                     target_file,
@@ -336,6 +461,7 @@ def run_backup(
                 )
                 created_targets.add(target_file)
                 processed += 1
+                bytes_copied += source_stat.st_size
                 consecutive_errors = 0
                 processed_files[rel_path] = {
                     "size": source_stat.st_size,
@@ -361,14 +487,47 @@ def run_backup(
                     )
                     break
 
-            progress_callback(
-                index,
-                total_files,
+            emitter.emit(
+                PHASE_TRANSFER,
                 f"Processed {index} / {total_files}",
+                kind="progress",
+                current=index,
+                total=total_files,
+                indeterminate=False,
+                level=LEVEL_ORGANIZE,
+                metrics={
+                    "processed": processed,
+                    "skipped": skipped,
+                    "errors": errors,
+                    "bytes_done": bytes_copied,
+                },
             )
 
         store.commit()
 
+        emitter.emit(
+            PHASE_ORGANIZE,
+            f"Extracted dates: {date_sources_label(date_sources)}.",
+            kind=KIND_LOG,
+            level=LEVEL_ORGANIZE,
+            metrics={"date_sources": date_sources},
+        )
+        emitter.emit(
+            PHASE_ORGANIZE,
+            f"Skipped {skipped} files (already exist).",
+            kind=KIND_LOG,
+            level=LEVEL_ORGANIZE,
+            metrics={"skipped": skipped},
+        )
+        emitter.emit(
+            PHASE_ORGANIZE,
+            f"Renamed/Organized {processed} new files.",
+            kind=KIND_LOG,
+            level=LEVEL_ORGANIZE,
+            metrics={"processed": processed},
+        )
+
+        elapsed = time.time() - start_time
         result = {
             "total": total_files,
             "processed": processed,
@@ -377,10 +536,44 @@ def run_backup(
             "error_details": error_details[:100],
             "warnings": warnings,
             "cancelled": cancelled,
-            "time": _format_duration(time.time() - start_time),
+            "total_bytes": total_bytes,
+            "bytes_copied": bytes_copied,
+            "oldest_backup": oldest_backup,
+            "time": _format_duration(elapsed),
         }
+        result = _finalize(result)
         if abort_message:
             result["error"] = abort_message
+        if cancelled:
+            summary_level = LEVEL_WARNING
+            summary_message = "Phone backup cancelled."
+        elif result.get("error") or errors:
+            summary_level = LEVEL_ERROR
+            summary_message = (
+                f"Phone backup finished with {errors} error(s) in {result['time']}."
+            )
+        else:
+            summary_level = LEVEL_SUCCESS
+            summary_message = (
+                f"Phone backup finished in {result['time']}: "
+                f"{processed} copied, {skipped} skipped, {errors} errors."
+            )
+        emitter.emit(
+            PHASE_DONE,
+            summary_message,
+            kind=KIND_SUMMARY,
+            level=summary_level,
+            current=processed,
+            total=total_files,
+            indeterminate=False,
+            metrics={
+                "processed": processed,
+                "skipped": skipped,
+                "errors": errors,
+                "bytes_copied": bytes_copied,
+                "date_sources": date_sources,
+            },
+        )
         return result
     finally:
         store.close()
