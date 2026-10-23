@@ -5,13 +5,16 @@ datas = []
 datas += collect_data_files('flet')
 datas += [('assets/syncup.png', 'assets')]
 
-hiddenimports = ['flet_desktop', 'flet_desktop.version']
-hiddenimports += collect_submodules('uvicorn')
+hiddenimports = [
+    'flet_desktop', 'flet_desktop.version',
+    'uvicorn', 'uvicorn.logging', 'uvicorn.loops', 'uvicorn.loops.auto',
+    'uvicorn.protocols', 'uvicorn.protocols.http', 'uvicorn.protocols.http.auto',
+    'uvicorn.protocols.websockets', 'uvicorn.protocols.websockets.auto',
+    'uvicorn.lifespan', 'uvicorn.lifespan.on',
+    'qrcode.image.svg'
+]
 hiddenimports += collect_submodules('fastapi')
 hiddenimports += collect_submodules('pydantic')
-hiddenimports += ['multipart']
-hiddenimports += collect_submodules('qrcode')
-hiddenimports += ['qrcode.image.svg']
 
 a = Analysis(
     ['main.py'],
