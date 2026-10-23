@@ -24,7 +24,7 @@ classifiers = [
     "Topic :: Multimedia :: Graphics",
     "Topic :: System :: Archiving :: Backup",
 ]
-dependencies = ["flet[desktop]==1.0.4"]
+dependencies = ["flet[desktop]==1.0.4", "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "pydantic>=2.7,<3", "python-multipart>=0.0.9", "qrcode>=7.4,<9"]
 
 [project.optional-dependencies]
 build = ["pyinstaller==6.22.3"]

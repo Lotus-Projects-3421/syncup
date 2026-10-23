@@ -50,6 +50,7 @@ __all__ = [
     "parse_date",
     "get_target_path",
     "run_backup",
+    "run_wifi_backup",
 ]
 
 MAX_CONSECUTIVE_ERRORS = 25
@@ -577,3 +578,482 @@ def run_backup(
         return result
     finally:
         store.close()
+
+
+def run_wifi_backup(
+    device_id: str,
+    staging_root: str,
+    selected_folders,
+    dest_path: str,
+    sort_mode: str,
+    media_filter: str,
+    conflict_mode: str,
+    progress_callback,
+    cancel_event,
+    error_callback=None,
+) -> dict:
+    """Back up files staged by the Wi-Fi server.
+
+    This mirrors :func:`run_backup` but reads directly from ``staging_root``
+    (there is no ``Internal shared storage`` probing and no MTP guard).  The
+    staging tree is **not** deleted here; ``wifi_server.run_backup_job`` owns
+    that cleanup in its ``finally`` block.
+    """
+    start_time = time.time()
+    started_at = iso_now()
+    emitter = ProgressEmitter(progress_callback)
+    date_sources = empty_date_sources()
+    bytes_copied = 0
+    detected = empty_detected()
+
+    def _finalize(data: dict) -> dict:
+        data.setdefault("detected", detected)
+        data.setdefault("date_sources", date_sources)
+        return with_timings(data, started_at, start_time)
+
+    staging = Path(staging_root)
+    dest_root = Path(dest_path)
+
+    # Never raise: wrap everything so a fatal problem becomes a result dict.
+    try:
+        if not staging.exists() or not staging.is_dir():
+            return _finalize({
+                "error": f"Staging directory was not found at {staging_root}.",
+                "total": 0,
+                "processed": 0,
+                "skipped": 0,
+                "errors": 0,
+                "error_details": [],
+                "cancelled": False,
+                "time": _format_duration(0),
+            })
+
+        try:
+            if dest_root.resolve().is_relative_to(staging.resolve()):
+                return _finalize({
+                    "error": "The destination folder cannot be inside the staging area.",
+                    "total": 0,
+                    "processed": 0,
+                    "skipped": 0,
+                    "errors": 0,
+                    "error_details": [],
+                    "cancelled": False,
+                    "time": _format_duration(0),
+                })
+        except (OSError, ValueError):
+            pass
+
+        try:
+            dest_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return _finalize({
+                "error": f"Cannot create destination folder: {exc}",
+                "total": 0,
+                "processed": 0,
+                "skipped": 0,
+                "errors": 0,
+                "error_details": [],
+                "cancelled": False,
+                "time": _format_duration(0),
+            })
+
+        root_folders = []
+        for folder in selected_folders or []:
+            relative = _safe_relative(folder)
+            if relative is None:
+                # Allow a bare top-level name even if _safe_relative rejects
+                # weird input; fall back to treating the raw name as a part.
+                raw = str(folder).replace("\\", "/").strip().strip("/")
+                if not raw or any(part in ("", ".", "..") for part in raw.split("/")):
+                    continue
+                relative = Path(*raw.split("/"))
+            folder_path = staging / relative
+            if folder_path.exists() and folder_path.is_dir():
+                root_folders.append((relative, folder_path))
+
+        # De-duplicate by resolved path while preserving order.
+        seen_dirs: set[Path] = set()
+        deduped: list[tuple[Path, Path]] = []
+        for relative, folder_path in root_folders:
+            key = folder_path.resolve() if folder_path.exists() else folder_path
+            if key in seen_dirs:
+                continue
+            seen_dirs.add(key)
+            deduped.append((relative, folder_path))
+        root_folders = deduped
+
+        if not root_folders:
+            # Fall back to staging root itself so a flat upload still works.
+            root_folders = [(Path("."), staging)]
+
+        store = None
+        try:
+            store = StateStore(device_id)
+            processed_files = store.load()
+            total_files = 0
+            processed = 0
+            skipped = 0
+            errors = 0
+            error_details: list[str] = []
+            warnings: list[str] = []
+            candidates: list[tuple[Path, str, os.stat_result]] = []
+            total_bytes = 0
+            found_files = 0
+
+            try:
+                emitter.emit(
+                    PHASE_SCAN,
+                    f"Scanning {len(root_folders)} folders...",
+                    kind=KIND_PHASE,
+                    indeterminate=True,
+                    level=LEVEL_WARNING,
+                    metrics={"folders": len(root_folders), "zips": 0, "loose": 0},
+                )
+                seen_paths: set[str] = set()
+
+                for relative, folder_path in root_folders:
+                    for source_file in get_media_files(folder_path, media_filter):
+                        try:
+                            source_stat = source_file.stat()
+                        except OSError as exc:
+                            errors += 1
+                            detail = f"{source_file.name}: cannot read file information ({exc})"
+                            error_details.append(detail)
+                            if error_callback:
+                                error_callback(source_file.name, str(exc))
+                            continue
+
+                        rel_path = source_file.relative_to(staging).as_posix()
+                        # Selected folders can overlap.
+                        if rel_path in seen_paths:
+                            continue
+                        seen_paths.add(rel_path)
+                        found_files += 1
+                        if _is_processed(
+                            processed_files.get(rel_path),
+                            source_stat.st_size,
+                            source_stat.st_mtime_ns,
+                        ):
+                            skipped += 1
+                            continue
+
+                        candidates.append((source_file, rel_path, source_stat))
+                        total_bytes += source_stat.st_size
+
+                total_files = len(candidates)
+                detected.update(
+                    {
+                        "total": found_files,
+                        "zips": 0,
+                        "loose": found_files,
+                        "folders": len(root_folders),
+                    }
+                )
+
+                emitter.emit(
+                    PHASE_SCAN,
+                    f"Scanning {len(root_folders)} folders... "
+                    f"Found 0 ZIP files and {found_files} loose files.",
+                    kind=KIND_LOG,
+                    indeterminate=True,
+                    level=LEVEL_WARNING,
+                    metrics={
+                        "folders": len(root_folders),
+                        "zips": 0,
+                        "loose": found_files,
+                        "candidates": total_files,
+                    },
+                )
+
+                oldest_backup = store.oldest_copied_at()
+                oldest_label = oldest_backup[:10] if oldest_backup else "none yet"
+                emitter.emit(
+                    PHASE_STATE,
+                    "Checking database... "
+                    f"Found {len(processed_files)} previously backed-up files. "
+                    f"(Oldest backup: {oldest_label}). "
+                    f"{total_files} new files to process.",
+                    kind=KIND_LOG,
+                    indeterminate=True,
+                    level=LEVEL_WARNING,
+                    metrics={
+                        "previously_backed_up": len(processed_files),
+                        "oldest_backup": oldest_backup,
+                        "new_files": total_files,
+                        "skipped": skipped,
+                    },
+                )
+
+                if total_files == 0:
+                    result = _finalize({
+                        "total": 0,
+                        "processed": 0,
+                        "skipped": skipped,
+                        "errors": errors,
+                        "error_details": error_details[:100],
+                        "warnings": warnings,
+                        "cancelled": False,
+                        "total_bytes": total_bytes,
+                        "bytes_copied": 0,
+                        "oldest_backup": oldest_backup,
+                        "time": _format_duration(time.time() - start_time),
+                    })
+                    emitter.emit(
+                        PHASE_DONE,
+                        "Wi-Fi backup finished: nothing new to copy.",
+                        kind=KIND_SUMMARY,
+                        level=LEVEL_SUCCESS,
+                        current=0,
+                        total=0,
+                        metrics={"processed": 0, "skipped": skipped, "errors": errors},
+                    )
+                    return result
+
+                try:
+                    free_bytes = shutil.disk_usage(dest_root).free
+                    if total_bytes > free_bytes:
+                        return _finalize({
+                            "error": (
+                                "Not enough free space at the destination. "
+                                f"Need {total_bytes / (1024 ** 3):.1f} GB, "
+                                f"only {free_bytes / (1024 ** 3):.1f} GB free."
+                            ),
+                            "total": total_files,
+                            "processed": 0,
+                            "skipped": skipped,
+                            "errors": errors,
+                            "error_details": error_details[:100],
+                            "cancelled": False,
+                            "total_bytes": total_bytes,
+                            "bytes_copied": 0,
+                            "oldest_backup": oldest_backup,
+                            "time": _format_duration(time.time() - start_time),
+                        })
+                except OSError:
+                    pass
+
+                cancelled = False
+                abort_message = None
+                consecutive_errors = 0
+                created_targets: set[Path] = set()
+
+                emitter.emit(
+                    PHASE_TRANSFER,
+                    f"Transferring {total_files} files...",
+                    kind=KIND_PHASE,
+                    current=0,
+                    total=total_files,
+                    indeterminate=False,
+                    level=LEVEL_ORGANIZE,
+                )
+
+                for index, (source_file, rel_path, source_stat) in enumerate(candidates, start=1):
+                    if cancel_event.is_set():
+                        cancelled = True
+                        break
+
+                    speed = bytes_copied / emitter.elapsed if emitter.elapsed > 0 else 0.0
+                    emitter.emit(
+                        PHASE_TRANSFER,
+                        f"Copying {source_file.name}... ({fileops.human_size(speed)}/s)",
+                        kind="progress",
+                        current=index - 1,
+                        total=total_files,
+                        indeterminate=False,
+                        level=LEVEL_ORGANIZE,
+                        metrics={
+                            "filename": source_file.name,
+                            "bytes_done": bytes_copied,
+                            "speed_bytes_per_sec": round(speed, 1),
+                        },
+                    )
+
+                    try:
+                        date_obj, date_source = date_with_source(source_file, source_stat)
+                        date_sources[date_source] = date_sources.get(date_source, 0) + 1
+                        target_file = build_target_path(
+                            source_file, dest_root, sort_mode, date_obj
+                        )
+
+                        created_this_run = target_file in created_targets
+                        if target_file.exists():
+                            if not created_this_run and fileops.is_same_file(
+                                source_file, target_file
+                            ):
+                                processed_files[rel_path] = {
+                                    "size": source_stat.st_size,
+                                    "mtime": source_stat.st_mtime_ns,
+                                }
+                                store.mark(
+                                    rel_path,
+                                    source_stat.st_size,
+                                    source_stat.st_mtime_ns,
+                                )
+                                created_targets.add(target_file)
+                                skipped += 1
+                                consecutive_errors = 0
+                                emitter.emit(
+                                    PHASE_TRANSFER,
+                                    f"Already present: {source_file.name}",
+                                    kind="progress",
+                                    current=index,
+                                    total=total_files,
+                                    indeterminate=False,
+                                    level=LEVEL_ORGANIZE,
+                                    metrics={"filename": source_file.name, "skipped": skipped},
+                                )
+                                continue
+
+                            if conflict_mode != "overwrite" or created_this_run:
+                                target_file = fileops.unique_path(target_file)
+
+                        fileops.copy_file_atomic(
+                            source_file,
+                            target_file,
+                            preserve_mtime=True,
+                        )
+                        created_targets.add(target_file)
+                        processed += 1
+                        bytes_copied += source_stat.st_size
+                        consecutive_errors = 0
+                        processed_files[rel_path] = {
+                            "size": source_stat.st_size,
+                            "mtime": source_stat.st_mtime_ns,
+                        }
+                        store.mark(
+                            rel_path,
+                            source_stat.st_size,
+                            source_stat.st_mtime_ns,
+                            commit=(processed % STATE_COMMIT_EVERY == 0),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        errors += 1
+                        consecutive_errors += 1
+                        detail = f"{rel_path}: {exc}"
+                        error_details.append(detail)
+                        if error_callback:
+                            error_callback(rel_path, str(exc))
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                            abort_message = (
+                                f"Stopped after {consecutive_errors} consecutive errors. "
+                                "The phone may have disconnected."
+                            )
+                            break
+
+                    emitter.emit(
+                        PHASE_TRANSFER,
+                        f"Processed {index} / {total_files}",
+                        kind="progress",
+                        current=index,
+                        total=total_files,
+                        indeterminate=False,
+                        level=LEVEL_ORGANIZE,
+                        metrics={
+                            "processed": processed,
+                            "skipped": skipped,
+                            "errors": errors,
+                            "bytes_done": bytes_copied,
+                        },
+                    )
+
+                store.commit()
+
+                emitter.emit(
+                    PHASE_ORGANIZE,
+                    f"Extracted dates: {date_sources_label(date_sources)}.",
+                    kind=KIND_LOG,
+                    level=LEVEL_ORGANIZE,
+                    metrics={"date_sources": date_sources},
+                )
+                emitter.emit(
+                    PHASE_ORGANIZE,
+                    f"Skipped {skipped} files (already exist).",
+                    kind=KIND_LOG,
+                    level=LEVEL_ORGANIZE,
+                    metrics={"skipped": skipped},
+                )
+                emitter.emit(
+                    PHASE_ORGANIZE,
+                    f"Renamed/Organized {processed} new files.",
+                    kind=KIND_LOG,
+                    level=LEVEL_ORGANIZE,
+                    metrics={"processed": processed},
+                )
+
+                elapsed = time.time() - start_time
+                result = {
+                    "total": total_files,
+                    "processed": processed,
+                    "skipped": skipped,
+                    "errors": errors,
+                    "error_details": error_details[:100],
+                    "warnings": warnings,
+                    "cancelled": cancelled,
+                    "total_bytes": total_bytes,
+                    "bytes_copied": bytes_copied,
+                    "oldest_backup": oldest_backup,
+                    "time": _format_duration(elapsed),
+                }
+                result = _finalize(result)
+                if abort_message:
+                    result["error"] = abort_message
+                if cancelled:
+                    summary_level = LEVEL_WARNING
+                    summary_message = "Wi-Fi backup cancelled."
+                elif result.get("error") or errors:
+                    summary_level = LEVEL_ERROR
+                    summary_message = (
+                        f"Wi-Fi backup finished with {errors} error(s) in {result['time']}."
+                    )
+                else:
+                    summary_level = LEVEL_SUCCESS
+                    summary_message = (
+                        f"Wi-Fi backup finished in {result['time']}: "
+                        f"{processed} copied, {skipped} skipped, {errors} errors."
+                    )
+                emitter.emit(
+                    PHASE_DONE,
+                    summary_message,
+                    kind=KIND_SUMMARY,
+                    level=summary_level,
+                    current=processed,
+                    total=total_files,
+                    indeterminate=False,
+                    metrics={
+                        "processed": processed,
+                        "skipped": skipped,
+                        "errors": errors,
+                        "bytes_copied": bytes_copied,
+                        "date_sources": date_sources,
+                    },
+                )
+                return result
+            finally:
+                store.close()
+        except Exception as exc:  # noqa: BLE001 - never raise
+            if store is not None:
+                try:
+                    store.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            return _finalize({
+                "error": f"Wi-Fi backup failed: {exc}",
+                "total": 0,
+                "processed": 0,
+                "skipped": 0,
+                "errors": 1,
+                "error_details": [str(exc)],
+                "cancelled": False,
+                "time": _format_duration(time.time() - start_time),
+            })
+    except Exception as exc:  # noqa: BLE001 - never raise
+        return _finalize({
+            "error": f"Wi-Fi backup failed: {exc}",
+            "total": 0,
+            "processed": 0,
+            "skipped": 0,
+            "errors": 1,
+            "error_details": [str(exc)],
+            "cancelled": False,
+            "time": _format_duration(time.time() - start_time),
+        })

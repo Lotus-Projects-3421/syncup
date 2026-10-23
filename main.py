@@ -21,6 +21,7 @@ from views.common import level_color, open_folder, show_snack
 from views.dedup_view import build_dedup_view
 from views.organizer_view import build_organizer_view
 from views.phone_view import build_phone_view
+from views.wifi_view import build_wifi_view
 
 # AppImages forward literal %U/%F field codes as arguments; strip them before
 # Flet or any folder-opening code can see them.
@@ -444,8 +445,18 @@ def main(page: ft.Page) -> None:
         post_ui,
     )
 
+    wifi_view = build_wifi_view(
+        page,
+        state,
+        log,
+        file_picker,
+        progress_queue,
+        play_ding,
+        post_ui,
+    )
+
     tabs = ft.Tabs(
-        length=3,
+        length=4,
         selected_index=0,
         animation_duration=300,
         expand=True,
@@ -457,6 +468,7 @@ def main(page: ft.Page) -> None:
                         ft.Tab(label="Phone Backup", icon=ft.Icons.PHONE_ANDROID),
                         ft.Tab(label="Special Organizer", icon=ft.Icons.AUTO_AWESOME),
                         ft.Tab(label="Duplicate Finder", icon=ft.Icons.CONTENT_COPY),
+                        ft.Tab(label="Wi-Fi", icon=ft.Icons.WIFI),
                     ]
                 ),
                 ft.TabBarView(
@@ -465,6 +477,7 @@ def main(page: ft.Page) -> None:
                         ft.Container(content=phone_view, padding=10, expand=True),
                         ft.Container(content=takeout_view, padding=10, expand=True),
                         ft.Container(content=dedup_view, padding=10, expand=True),
+                        ft.Container(content=wifi_view, padding=10, expand=True),
                     ],
                 ),
             ],

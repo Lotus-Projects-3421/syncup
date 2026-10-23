@@ -1,16 +1,24 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 datas = []
 datas += collect_data_files('flet')
 datas += [('assets/syncup.png', 'assets')]
+
+hiddenimports = ['flet_desktop', 'flet_desktop.version']
+hiddenimports += collect_submodules('uvicorn')
+hiddenimports += collect_submodules('fastapi')
+hiddenimports += collect_submodules('pydantic')
+hiddenimports += ['multipart']
+hiddenimports += collect_submodules('qrcode')
+hiddenimports += ['qrcode.image.svg']
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=['flet_desktop', 'flet_desktop.version'],
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
