@@ -31,8 +31,8 @@ FLET_VERSION="$("$PYTHON" -c 'from flet_desktop.version import version; print(ve
 DESKTOP_NAME="io.github.lotus_projects_3421.SyncUp.desktop"
 
 echo "==> SyncUp version ${VERSION} (Flet ${FLET_VERSION})"
-echo "==> Generating icon"
-"$PYTHON" scripts/make_icon.py
+# echo "==> Generating icon"
+# "$PYTHON" scripts/make_icon.py
 
 echo "==> Running tests"
 "$PYTHON" -m unittest discover -s tests -t . -v
@@ -52,8 +52,15 @@ cp "AppDir/${DESKTOP_NAME}" "AppDir/usr/share/applications/${DESKTOP_NAME}"
 sed "s/@VERSION@/${VERSION}/" \
     packaging/io.github.lotus_projects_3421.SyncUp.appdata.xml \
     > AppDir/usr/share/metainfo/io.github.lotus_projects_3421.SyncUp.appdata.xml
-mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
-cp assets/syncup.png AppDir/usr/share/icons/hicolor/256x256/apps/syncup.png
+mkdir -p AppDir/usr/share/icons/hicolor/512x512/apps \
+         AppDir/usr/share/icons/hicolor/256x256/apps
+cp assets/syncup.png AppDir/usr/share/icons/hicolor/512x512/apps/syncup.png
+"$PYTHON" - <<'PYICON'
+from PIL import Image
+im = Image.open("assets/syncup.png").convert("RGBA")
+im.resize((256, 256), Image.LANCZOS).save(
+    "AppDir/usr/share/icons/hicolor/256x256/apps/syncup.png", "PNG", optimize=True)
+PYICON
 
 # Bundle the cached Flet desktop runtime when available.  Without this the
 # first launch may try to download it (and a frozen PyInstaller app cannot use

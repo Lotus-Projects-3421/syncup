@@ -1,5 +1,7 @@
 # SyncUp
 
+![SyncUp banner](assets/banner.png)
+
 Safe Android photo/video backup and Google Takeout organization for Linux.
 
 SyncUp is built around one rule: **never replace or remove a destination file until the new copy has been written and verified**. It is a desktop app written in Python with Flet, with separate tabs for phone backup, Wi-Fi backup, Takeout organization, and duplicate cleanup.
