@@ -52,15 +52,8 @@ cp "AppDir/${DESKTOP_NAME}" "AppDir/usr/share/applications/${DESKTOP_NAME}"
 sed "s/@VERSION@/${VERSION}/" \
     packaging/io.github.lotus_projects_3421.SyncUp.appdata.xml \
     > AppDir/usr/share/metainfo/io.github.lotus_projects_3421.SyncUp.appdata.xml
-mkdir -p AppDir/usr/share/icons/hicolor/512x512/apps \
-         AppDir/usr/share/icons/hicolor/256x256/apps
+mkdir -p AppDir/usr/share/icons/hicolor/512x512/apps
 cp assets/syncup.png AppDir/usr/share/icons/hicolor/512x512/apps/syncup.png
-"$PYTHON" - <<'PYICON'
-from PIL import Image
-im = Image.open("assets/syncup.png").convert("RGBA")
-im.resize((256, 256), Image.LANCZOS).save(
-    "AppDir/usr/share/icons/hicolor/256x256/apps/syncup.png", "PNG", optimize=True)
-PYICON
 
 # Bundle the cached Flet desktop runtime when available.  Without this the
 # first launch may try to download it (and a frozen PyInstaller app cannot use
