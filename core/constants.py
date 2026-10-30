@@ -1,7 +1,7 @@
 """Shared constants for SyncUp."""
 
 APP_NAME = "SyncUp"
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 # Media types handled by the app. Raw image formats are included so phone
 # backups do not silently skip DNG/RAW files.

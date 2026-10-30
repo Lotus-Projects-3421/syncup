@@ -53,6 +53,8 @@ sed "s/@VERSION@/${VERSION}/" \
     packaging/io.github.lotus_projects_3421.SyncUp.appdata.xml \
     > AppDir/usr/share/metainfo/io.github.lotus_projects_3421.SyncUp.appdata.xml
 mkdir -p AppDir/usr/share/icons/hicolor/512x512/apps
+cp assets/syncup.png AppDir/syncup.png
+cp assets/syncup.png AppDir/.DirIcon
 cp assets/syncup.png AppDir/usr/share/icons/hicolor/512x512/apps/syncup.png
 
 # Bundle the cached Flet desktop runtime when available.  Without this the
