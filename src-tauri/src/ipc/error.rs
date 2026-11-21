@@ -2,6 +2,7 @@ use serde::Serialize;
 use specta::Type;
 
 pub const DB_ERROR: &str = "DB_ERROR";
+pub const MIGRATION_FAILED: &str = "MIGRATION_FAILED";
 pub const UNKNOWN: &str = "UNKNOWN";
 
 /// Structured error returned across the Tauri IPC boundary.
@@ -27,6 +28,11 @@ impl IpcError {
     #[must_use]
     pub fn db(message: &str) -> Self {
         Self::new(DB_ERROR, message)
+    }
+
+    #[must_use]
+    pub fn migration(message: &str) -> Self {
+        Self::new(MIGRATION_FAILED, message)
     }
 
     #[must_use]

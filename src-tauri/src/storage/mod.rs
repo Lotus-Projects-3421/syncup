@@ -3,6 +3,11 @@ use std::path::Path;
 use r2d2_sqlite::SqliteConnectionManager;
 use thiserror::Error;
 
+pub mod migration;
+pub mod profiles;
+pub mod schema;
+pub mod settings;
+
 pub type DbPool = r2d2::Pool<SqliteConnectionManager>;
 
 #[derive(Debug, Error)]
@@ -11,13 +16,16 @@ pub enum StorageError {
     CreateDirectory(#[source] std::io::Error),
     #[error("failed to open the local database")]
     OpenDatabase(#[source] r2d2::Error),
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
-/// Opens the SQLite connection pool in the platform application data directory.
-///
-/// Phase 2 intentionally creates no tables and does not write `PRAGMA user_version`.
-/// Writing a schema version here would make Phase 3 believe its migrations had
-/// already run. The version is only read and reported.
+/// Opens the SQLite connection pool in the platform application data directory
+/// and ensures Schema v2 tables and version markers are initialized.
 pub fn open_pool(data_dir: &Path) -> Result<DbPool, StorageError> {
     std::fs::create_dir_all(data_dir).map_err(StorageError::CreateDirectory)?;
 
@@ -36,8 +44,13 @@ pub fn open_pool(data_dir: &Path) -> Result<DbPool, StorageError> {
                 })
         });
 
-    r2d2::Pool::builder()
+    let pool = r2d2::Pool::builder()
         .max_size(4)
         .build(manager)
-        .map_err(StorageError::OpenDatabase)
+        .map_err(StorageError::OpenDatabase)?;
+
+    let conn = pool.get().map_err(StorageError::OpenDatabase)?;
+    schema::init_schema(&conn).map_err(StorageError::Sqlite)?;
+
+    Ok(pool)
 }

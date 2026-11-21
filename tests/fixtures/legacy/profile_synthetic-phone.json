@@ -1,0 +1,10 @@
+{
+  "destination": "/tmp/synthetic-destination",
+  "sorting": "month",
+  "filter": "photos",
+  "conflict": "keep",
+  "folders": [
+    "DCIM/Camera",
+    "Pictures/Screenshots"
+  ]
+}

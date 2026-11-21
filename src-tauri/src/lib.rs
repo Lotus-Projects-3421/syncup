@@ -20,7 +20,13 @@ use crate::state::AppState;
 pub fn specta_builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new().commands(collect_commands![
         commands::system::app_version,
-        commands::system::health_check
+        commands::system::health_check,
+        commands::migration::migrate_legacy_import,
+        commands::migration::get_migration_status,
+        commands::migration::get_settings,
+        commands::migration::update_settings,
+        commands::migration::list_profiles,
+        commands::migration::save_profile
     ])
 }
 
@@ -40,6 +46,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             app.manage(AppState {
                 db,
+                data_dir,
                 _log_guard: log_guard,
             });
 
