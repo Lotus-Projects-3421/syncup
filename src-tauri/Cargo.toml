@@ -1,0 +1,42 @@
+[package]
+name = "syncup"
+version = "2.0.0"
+description = "Safe Android phone photo/video backup and Google Takeout organizer"
+authors = ["SyncUp contributors"]
+edition = "2021"
+rust-version = "1.100"
+license = "MIT"
+repository = "https://github.com/Lotus-Projects-3421/syncup"
+
+[lib]
+name = "syncup_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "syncup"
+path = "src/main.rs"
+
+[[bin]]
+name = "specta-gen"
+path = "src/bin/specta_gen.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.7.6", features = [] }
+
+[dependencies]
+r2d2 = "0.8.10"
+r2d2_sqlite = "0.37.1"
+rusqlite = { version = "0.42", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+specta = { version = "=2.0.0-rc.28", features = ["derive", "function"] }
+specta-typescript = "0.0.15"
+tauri = { version = "2.12.7", features = [] }
+tauri-specta = { version = "=2.0.0-rc.29", features = ["derive", "typescript"] }
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
