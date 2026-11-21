@@ -1109,3 +1109,320 @@ The duplicate finder keeps no DB rows: dedup state is in-memory hashes plus an o
 - **Whether any production user has `state_*.json` without a matching `.db`** — possible by code path, but not observable here.
 - **Original device IDs behind sanitized filenames** — unrecoverable by design.
 - **Windows/macOS path behaviour** — code branches exist but were never validated (A1.4).
+
+---
+
+# Audit chunk A4 — views, Wi-Fi routes/session/security, platform code, test baseline, feature inventory
+
+> Scope: `views/` (all six modules read in full), `core/wifi_server.py` (re-read for routes/auth/session/upload limits), platform branches across the repo, the legacy test suite, and a live test-baseline run. A2.4 already covered Wi-Fi **path validation, staging, and missing-file logic**; this chunk goes deeper on **routes, authentication, transport, upload resource limits, and session lifecycle** and references A2.4 rather than repeating it. No application file was modified; `docs/AUDIT.md` is the only write target. No real file under `~/.config/SyncUp/` was read, listed, copied, or opened.
+
+## A4.1 Views inventory
+
+`views/__init__.py` is empty (package marker only) and is omitted. Flet layout boilerplate is not listed.
+
+| File | Responsibility (one line) | User-visible features exposed |
+|---|---|---|
+| `views/common.py` | Shared UI helpers: log-level colours, folder opener, snackbars, job button state, progress-callback bridge, end-of-run scoreboard dialog. | Colour-coded activity log; “Open Destination Folder”; error snackbars; Cancel button state; run-summary dialog with timings, detected/skipped/processed counts, date-source breakdown, duplicate stats, error list. |
+| `views/phone_view.py` | USB/MTP tab: device polling, folder browser, multi-folder selection, destination/filter/conflict/sort controls, profile load/save, backup launch. | Device refresh + selection; breadcrumb folder navigation; multi-folder checkboxes; destination picker/opener; photos/videos filter; Keep Both vs Overwrite; Day/Month/Year/Flat sorting; Start/Cancel; completion summary. |
+| `views/organizer_view.py` | Takeout / loose-folder tab: input folder or multi-ZIP selection, destination, filter/conflict/sort, optional sidecar preservation, organizer launch. | Browse folder or multiple ZIPs; destination picker/opener; media filter; conflict mode; sorting; “Preserve JSON metadata sidecars” checkbox; Start/Cancel; summary with detected ZIPs/loose files/folders and date sources. |
+| `views/dedup_view.py` | Duplicate-finder tab: folder selection, preview gate, move, undo-last-move, cancellation. | Preview-before-move enforcement; duplicate count/group/size preview; “Move Duplicates”; “Undo Last Move”; manifest path in the log; per-mode summary dialogs. |
+| `views/wifi_view.py` | Wi-Fi tab: owns server lifecycle, QR/status UI, destination/settings, staging-dir creation/pruning, profile persistence, snapshot rendering, shutdown watchdog. | Start/Stop Wi-Fi server; scannable QR + LAN URL; phone-connected/upload counters; staging path display; destination picker/opener; filter/conflict/sort; Cancel Processing; live “receiving/copying” status; completion summary. |
+
+### A4.1.1 Coupling observations (migration-relevant)
+
+- **Business logic lives in the view layer.** `views/wifi_view.py` owns `create_staging_dir()` and `_prune_stale_directories()` (lines 132–167), the QR helpers (lines 62–129), the Uvicorn start/stop orchestration (lines 709–822), and Wi-Fi profile persistence (lines 403–415). These are service/domain concerns that the Rust port must relocate, not reimplement inside Svelte components.
+- **`views/phone_view.py` owns device polling and profile semantics** — a 20-second `auto_scan` loop (lines 450–459), profile read/normalisation (lines 277–305), and profile write on Start (lines 401–413). The engine is only called with a pre-snapshotted tuple.
+- **Confirmation and pre-condition policy lives in the views**, not the engines: duplicate move requires a matching preview (`dedup_view.py:254–264`), and phone/organizer Start refuse when inputs are missing (`phone_view.py:383–389`, `organizer_view.py:205–207`). A Rust backend must enforce these invariants server-side; the SPEC forbids trusting frontend validation.
+- **`views/common.py` contains platform branches** (`open_folder`, lines 84–103) and the scoreboard result-shape assumptions. It is the only view module covered by tests (`tests/test_common.py`), and only for helpers.
+
+## A4.2 Wi-Fi server audit (routes, auth, session, upload limits)
+
+> A2.4.3 already documented the endpoint list and `safe_relative_path` rules. This section adds the auth/transport/session/limit analysis and route-level test evidence.
+
+### A4.2.1 Route inventory (auth column is the key addition)
+
+| Method | Path | Purpose | Auth / token required | Notes |
+|---|---|---|---|---|
+| GET | `/` | Serve the mobile HTML page | **None** | `Cache-Control: no-store`; no CSP header. |
+| GET | `/favicon.ico` | Silence favicon requests | **None** | Returns 204. |
+| POST | `/manifest` | Diff the phone’s file list against SQLite state and open an upload session | **None** | 409 only while `session.is_processing()`; any client may otherwise reset the session. |
+| POST | `/upload` | Stream one file into staging | **None** (only “was this path in the last manifest?”) | 409 if processing; 400/507 for path/size/space failures; 500 on write failure. |
+| POST | `/complete` | Start the PC-side backup job | **None** | 409 if another Flet job is running; 400 if nothing was uploaded; otherwise spawns the engine thread. |
+| GET | `/status` | Phone polling for stage/counters/current file | **None** | Leaks current filename and error text to any LAN client. |
+
+All routes are synchronous functions (`def`, not `async def`), so FastAPI runs them in its worker pool; this is deliberate for blocking SQLite/disk I/O.
+
+### A4.2.2 Authentication / token / session mechanism
+
+**Absent.** There is no authentication dependency, middleware, header check, bearer token, pairing code, cookie, or per-client session identifier anywhere in `core/wifi_server.py` (repo-wide grep for `Depends`, `middleware`, `Authorization`, `Bearer`, `token`, `CORS`, `TrustedHost` returns nothing in that module).
+
+The app is created with no auth layer and one process-global session:
+
+```python
+app = FastAPI(title="SyncUp Wi-Fi Backup", version=VERSION)
+telemetry = WiFiTelemetry(progress_queue, post_ui)
+session = BackupSession()
+```
+(`core/wifi_server.py:1000-1002`)
+
+`/manifest` performs no identity check; it immediately rewrites the shared session:
+
+```python
+if session.is_processing():
+    raise HTTPException(status_code=409, detail="A backup is already being processed.")
+ip = client_ip(request)
+state = _read_state(device_id)
+missing, total_bytes, ignored = compute_missing_files(payload.files, state, media_filter)
+...
+session.begin_manifest(missing, ip, folders)
+```
+(`core/wifi_server.py:1096-1118`)
+
+The only upload gate is “this path appeared in the most recent manifest”:
+
+```python
+expected = session.expectation(rel)
+if expected is None:
+    raise HTTPException(status_code=409, detail="This file was not requested by the manifest.")
+```
+(`core/wifi_server.py:1161-1166`)
+
+Because any client can post its own manifest first, that gate is **self-service**, not authentication. `client_ip` is used only for display/telemetry (`client_ip()` at lines 1013–1017); it is never used for authorisation. `ManifestRequest.device_id` is accepted (`wifi_models.py:59-63`) but **ignored** — the route uses the `create_app(device_id=...)` closure, which is always `"wifi-backup"` from `views/wifi_view.py:45`. Uvicorn access logging is disabled (`access_log=False`, line 1348), so there is no request audit trail.
+
+`BackupSession` has no session id, token, creation time, last-activity time, or expiry. Its `_pending` / `_expectations` sets are plain process-global state (`wifi_server.py:774-958`).
+
+### A4.2.3 Transport encryption
+
+**Absent — the server is plain HTTP.** `WiFiServer` defaults to `host="0.0.0.0"` (line 1323) and passes no TLS material:
+
+```python
+config = uvicorn.Config(
+    app=app,
+    host=self.host,
+    port=self.port,
+    log_level=self.log_level,
+    access_log=False,
+    lifespan="on",
+)
+```
+(`core/wifi_server.py:1343-1350`)
+
+No `ssl_keyfile`, `ssl_certfile`, or `https` appears anywhere in the module. The QR payload is explicitly `http://`:
+
+```python
+url = f"http://{address}:{server.port}"
+```
+(`views/wifi_view.py:464`)
+
+There is no Host-header validation, no Origin/Referer check, no HSTS, and no CSP on the mobile page. The server is reachable by every device on the LAN, including a browser on the same machine via `127.0.0.1`.
+
+### A4.2.4 Upload handling
+
+- **Destination directory:** a per-server-run staging directory created by `views/wifi_view.py:150-167` under `tempfile.gettempdir()/syncup-wifi/wifi-<8hex>` (or `SYNCUP_WIFI_STAGING_DIR`), with mode `0o700`. The final destination is a separate `dest_root` supplied to `create_app`.
+- **Filename sanitisation:** `safe_relative_path()` (`core/wifi_server.py:650-674`) normalises `\` to `/`, rejects empty/oversize/NUL/absolute/`~`/`..`/dot-leading/`:`/partial names, then the upload route resolves `(staging / parts)` and requires `is_relative_to(staging_root)` (`:1183-1186`). **A2.4.3 already documents these rules; not repeated here.** Note the rules are POSIX-oriented: Windows reserved device names (`CON`, `NUL`, `COM1`, trailing dot/space) are not rejected.
+- **Size checks that exist:** declared `size` must equal the manifest size (`:1170-1174`); `UploadFile.size`, when present, must equal the declared size (`:1176-1181`); `copy_stream_atomic` verifies the written byte count equals `expected_size` (`core/fileops.py:141-144`); a free-space check compares the **declared** size against staging free space (`:1188-1196`).
+- **Size limits that are absent:** no maximum upload size, no maximum total session size, no maximum number of manifest entries (`ManifestRequest.files` is an unbounded `list`, `wifi_models.py:64-67`), no request-body limit, no rate limit, no concurrent-upload cap. The only bound is the declared size and current free disk.
+- **Over-declared stream hazard:** `copy_stream_atomic` writes until EOF **before** comparing the byte count (`core/fileops.py:128-144`). A client that declares a small size can therefore stream far more bytes to disk; the mismatch is detected only after the write, and the temp file is then deleted. The free-space check used the declared size, not the streamed size.
+- **Repeat uploads are allowed:** `expectation()` reads `_expectations`, and `note_upload()` only discards from `_pending` (`wifi_server.py:824-836`). A retry after success returns `False` but still overwrites the staged copy (`:1219-1229`). There is no per-file or per-session upload-count cap.
+- **Integrity:** content is **not hashed**; verification is size-only. The staged file is later processed by `run_wifi_backup`, which publishes through the atomic temp/verify/replace pipeline (A2.3).
+- **Cleanup:** the engine’s `finally` does `shutil.rmtree(staging_root, ignore_errors=True)` (`wifi_server.py:1066-1073`); the view also removes staging on a clean stop when no job is active (`views/wifi_view.py:691-697`). `create_staging_dir()` prunes directories named `wifi-*`/`syncup-wifi-*` older than 24 hours **at the next server start** (`views/wifi_view.py:132-147`). There is no startup/startup-crash recovery for interrupted uploads beyond that 24-hour prune.
+
+### A4.2.5 Manifest-comparison flow
+
+1. Phone posts `{device_id, files:[{rel_path,size,mtime_ns}]}` to `POST /manifest`.
+2. Route rejects with 409 only if `session.is_processing()`.
+3. `_read_state(device_id)` opens a **fresh `StateStore` per request**, reads the full `processed` table, closes it (`wifi_server.py:687-700`). This also re-imports legacy `state_*.json` on every request (A2.2/A3.5).
+4. `compute_missing_files()` (`:703-766`) drops unsafe/hidden/duplicate entries and media-filter misses, returns `new` for absent rows, `modified` for size mismatch or mtime delta > 2 s, and **trusts `size IS NULL` legacy rows as already backed up**. `total_bytes` sums the missing entries.
+5. `session.begin_manifest()` stores `_pending` (paths to accept) and `_expectations` (path → `(size, mtime_ns)`), resets counters, and sets stage `uploading`. It derives `selected_folders` from the **first path component only when the path has more than one component** (`:1110-1117`), so root-level uploads rely on the engine’s staging-root fallback (A2.3).
+6. Response is `{missing:[...], total_bytes}`. The phone uploads each missing path, then calls `/complete`.
+
+`device_id` from the request is not used for state selection; every Wi-Fi client shares the `create_app` device id (`"wifi-backup"`).
+
+### A4.2.6 Session lifecycle and timeout behaviour
+
+**Who starts it:** the user clicks “Start Wi-Fi Server” in `views/wifi_view.py:709-799`. That worker calls `create_staging_dir()`, `find_available_port(8555)`, `create_app(...)`, `WiFiServer(port).start(app)`, then `wait_until_ready(5.0)`. The server runs in a daemon Uvicorn thread (`wifi_server.py:1337-1357`).
+
+**State machine (`BackupSession`):** `waiting → uploading` (`begin_manifest`) `→ processing` (`begin_processing`, triggered by `/complete`) `→ done | error` (`finish`), with `fail()` forcing `error`. `begin_processing()` returns `already`, `done`, or `empty`; `/complete` returns 400 on `empty` and spawns the engine only on `started` (`:1252-1277`).
+
+**How it stops:**
+- User “Stop Server” sets `cancel_event`, then calls `server.stop()` (`views/wifi_view.py:801-822`); the engine aborts at its next file boundary.
+- App close: `_shutdown_watch()` waits on `shutdown_event`, stops the server with a 2 s timeout, and removes staging (`views/wifi_view.py:844-864`).
+- `WiFiServer.stop()` sets `should_exit`, joins for 5 s, then sets `force_exit` and joins 1 s more (`wifi_server.py:1388-1404`).
+
+**Timeout behaviour:**
+- Server readiness: 5 s (`wait_until_ready`).
+- **No server-side session expiry, upload idle timeout, or per-client timeout.**
+- Client-side only: uploads retry 3 times with 800 ms × attempt backoff (`wifi_server.py` mobile JS `uploadWithRetry`); `/complete` retries 20 times at 3 s intervals while 409 (`completeWithRetry`); `/status` polls every 1.5 s and gives up after 40 consecutive errors (`pollStatus`).
+- `/complete` clears a stale `cancel_event` before starting a new engine run (`:1265-1266`).
+- `finish()` and `fail()` clear `_pending`/`_expectations`, so late uploads are rejected only after the job ends.
+
+### A4.2.7 Security gaps (ranked)
+
+**Three biggest gaps**
+
+1. **No authentication or pairing at all, and the manifest gate is self-service.** Any LAN device can `POST /manifest` with its own file list, receive its own `_expectations`, `POST /upload` arbitrary media-extension files up to disk capacity, and `POST /complete` to make the PC publish them into the user’s destination. This is an unauthenticated remote write primitive, not just an “unrestricted endpoint”.
+2. **Plain HTTP on `0.0.0.0` with no Host/Origin validation.** Traffic (paths, filenames, metadata) is readable on the LAN; a malicious web page can reach `127.0.0.1:8555` (DNS rebinding), and `/upload` (multipart) plus `/complete` (bodyless POST) are “simple” cross-origin requests, so browser-side CSRF-style triggering is possible. There is no TLS, no CSP, and no HSTS.
+3. **No resource limits or session expiry.** The app enforces no maximum upload size, total bytes, manifest length, upload count, or rate. `copy_stream_atomic` writes to EOF before the size check, so an over-declared stream can transiently fill the disk; a huge manifest can consume memory; repeated `/manifest` calls reset the single global session and orphan staged files. There is no idle/absolute timeout.
+
+**Full gap register**
+
+| ID | Gap | Evidence | Impact |
+|---|---|---|---|
+| W-01 | No auth/token/pairing; one global `BackupSession` | `wifi_server.py:1000-1002`, `1096-1118` | Any LAN client can start/steer a backup. |
+| W-02 | No TLS; `http://` QR; binds `0.0.0.0` | `wifi_server.py:1323`, `1343-1350`; `wifi_view.py:464` | LAN eavesdropping; no confidentiality. |
+| W-03 | No Host/Origin/CORS validation; no CSP/HSTS | no middleware in `create_app`; index only sets `Cache-Control` | DNS rebinding / CSRF-style triggering. |
+| W-04 | No upload/body/manifest size or rate limits | `wifi_models.py:64-67`; `fileops.py:128-144`; upload route | Disk-fill / memory DoS; transient over-write. |
+| W-05 | No session expiry or idle timeout | `BackupSession` has no time fields | Server stays actionable indefinitely. |
+| W-06 | Single global session; any client can reset it | `begin_manifest` unconditionally resets; only processing blocks it | Cross-client interference; last client wins. |
+| W-07 | `device_id` ignored; all phones share state | `wifi_models.py:59-63`; route uses closure `device_id` | Wrong-device skips; state namespace collision (A2.2/A3 R3). |
+| W-08 | `/status` leaks current filename and error text | `StatusResponse.current_file`, `error` | Information disclosure to any LAN client. |
+| W-09 | No request/access audit log | `access_log=False` | No forensic trail. |
+| W-10 | POSIX-only path rules | `safe_relative_path` rejects `:` but not Windows reserved names/trailing dot-space | Cross-platform path hazard for v2. |
+| W-11 | No content hash | size-only verification | Integrity depends on transport + size. |
+| W-12 | Interrupted-upload cleanup only at next start, 24 h cutoff | `wifi_view.py:132-147` | Stale staging debris can persist. |
+
+This is the clearest conflict with SPEC Layer 2 §5B and the standing rule “Never expose an unrestricted upload endpoint.” v2 must not reproduce W-01–W-06.
+
+## A4.3 Platform-specific code
+
+No `platform.system()` call exists anywhere in the repo. Platform branching uses `sys.platform` and `os.name` only. Repo-wide search found these sites:
+
+| Site | Branch | What it does | Validated? |
+|---|---|---|---|
+| `main.py:32-48` (`_play_ding`) | `os.name == "nt"` → `winsound.Beep`; `sys.platform == "darwin"` → `afplay`; else → `canberra-gtk-play` | Completion sound in a daemon thread; all failures swallowed. | Linux path only (per A1.4/README). Windows/macOS branches exist but are unvalidated. |
+| `views/common.py:83-104` (`open_folder`) | `sys.platform.startswith("darwin")` → `open`; `os.name == "nt"` → `os.startfile`; else → `xdg-open` | Opens the destination in the file manager without blocking. | Linux path only; `tests/test_common.py:84-107` mocks `sys.platform="linux"` and `xdg-open`. |
+| `core/storage.py:25-35` (`get_app_data_dir`) | `os.name == "nt"` → `%APPDATA%`; `sys.platform == "darwin"` → `~/Library/Application Support`; else `$XDG_CONFIG_HOME`/`~/.config` | Chooses the config directory and creates it. | Linux path only. |
+| `core/device.py:1-128` | None — hard-coded Linux | `gio mount`, `os.getuid()`, `getpass.getuser()`, `/run/user/<uid>/gvfs`, `/media/<user>`, `/run/media/<user>`, names containing `mtp`. | Linux only; **no Windows/macOS implementation**. |
+| `build.sh` / `SyncUp.spec` | Linux packaging | Requires `./appimagetool`, builds `AppDir`, bundles the Flet desktop runtime, emits `dist/SyncUp_v<VERSION>.AppImage`. | Linux only; no MSI/NSIS/.app/.dmg. |
+
+### What is Linux-only today
+
+1. **USB/MTP device discovery and folder browsing** (`core/device.py`) — GVFS/GIO and Linux mount paths. This is the largest platform gap; SPEC requires Windows/macOS investigation and a separate platform layer.
+2. **Packaging and release output** — AppImage only (`build.sh`, `SyncUp.spec`); no Windows or macOS artifacts.
+3. **Default completion sound** — `canberra-gtk-play` on the non-Windows/non-macOS branch; optional and failure-tolerant.
+4. **Folder opener default** — `xdg-open` on the non-Windows/non-macOS branch.
+5. **CI** — `.github/workflows/ci.yml` runs only `ubuntu-latest` (Python 3.10/3.12); no Windows/macOS runners.
+
+### Branches that exist but are unvalidated
+
+- Windows/macOS config directory selection (`core/storage.py:27-31`).
+- Windows `os.startfile` and macOS `open` folder opening (`views/common.py:84-92`).
+- Windows `winsound` and macOS `afplay` completion sound (`main.py:33-40`).
+- `os.replace()` atomic publish and `shutil.move` duplicate moves on Windows/macOS filesystems (case-insensitive, open-file, antivirus, cross-volume semantics) — **no tests**.
+
+### Cross-platform hazards for the Rust port
+
+- **State-key path form diverges by workflow:** MTP rows store `str(relative_to(...))` (OS-native separators) while Wi-Fi rows store `as_posix()` (A3.1). A consolidated Rust schema needs one canonical form and a migration rule.
+- **`safe_relative_path` is POSIX-centric:** `:` is rejected (good for drive letters/ADS), but Windows reserved device names and trailing dot/space are not.
+- **Case-insensitive filesystems** make `unique_path()` collision probing and duplicate-name handling behave differently on Windows/macOS; untested.
+- **No cross-platform CI or device tests**; Linux success must not be reported as Windows/macOS support (standing rule).
+
+## A4.4 Test baseline
+
+### Command actually used
+
+The project does **not** use pytest: `pytest.ini`, `tox.ini`, and `setup.cfg` are absent, and `pytest` is **not installed** in the project venv. README (`## Tests`) and CI (`.github/workflows/ci.yml:36-37`) define the command as:
+
+```
+python -m unittest discover -s tests -t . -v
+```
+
+`python` is not on `PATH` in this environment; `python3` is, and the project venv (`.venv/bin/python` → `/usr/bin/python3`, Python 3.12.3) contains all runtime dependencies (`flet`, `fastapi`, `uvicorn`, `pydantic`, `multipart`, `qrcode`). The baseline was therefore run with the project’s venv interpreter, preserving `pipefail` and `tee` exactly as required:
+
+```
+set -o pipefail
+.venv/bin/python -m unittest discover -s tests -t . -v 2>&1 \
+  | tee /tmp/syncup-pytest-baseline.log | tail -40
+```
+
+Nothing was installed. The pipeline completed with the shell reporting success (exit status 0).
+
+### Baseline summary — verbatim from the full log
+
+Full log: `/tmp/syncup-pytest-baseline.log` (110 lines). Extracted with `grep -n -E "^(Ran |OK|FAILED|ERROR)|passed|failed|error[s]?="` over the **entire** log, not the tail:
+
+```
+Ran 105 tests in 8.752s
+
+OK
+```
+
+`grep -c "\.\.\. ok$"` on the full log returns `105`. The README claim of “105 unit tests” is accurate at this commit.
+
+### Test inventory (11 files, 105 tests)
+
+| File | Count | Test function names |
+|---|---:|---|
+| `tests/test_cli.py` | 3 | `test_placeholder_tokens_are_removed`, `test_real_paths_are_preserved`, `test_case_insensitive_and_empty_input` |
+| `tests/test_common.py` | 11 | `test_imports_do_not_start_the_app`, `test_card_builds`, `test_job_button_lifecycle`, `test_error_lines_are_capped`, `test_human_size_is_reexported`, `test_level_colors_switch_with_theme`, `test_open_folder_missing_path_calls_error_callback`, `test_open_folder_launches_opener_without_blocking`, `test_open_folder_failure_is_reported_not_raised`, `test_progress_callback_forwards_and_logs_phase_events`, `test_progress_callback_does_not_log_every_file` |
+| `tests/test_dedup.py` | 9 | `test_preview_does_not_move_files`, `test_move_creates_manifest_and_undo_restores`, `test_manifest_is_written_before_moves`, `test_no_duplicates`, `test_cancel_during_hashing`, `test_undo_malformed_entry_is_reported`, `test_undo_without_manifest_reports_error`, `test_duplicate_folder_is_not_rescanned`, `test_undo_does_not_overwrite_an_existing_original` |
+| `tests/test_engine.py` | 14 | `test_basic_backup`, `test_second_run_skips_already_backed_up_file`, `test_keep_both_when_source_changes`, `test_overwrite_replaces_only_after_verified_copy`, `test_overwrite_does_not_lose_files_with_colliding_targets`, `test_same_size_change_is_detected_by_mtime`, `test_overlapping_selected_folders_copy_each_file_once`, `test_media_filter`, `test_cancel_before_copy`, `test_legacy_state_is_respected`, `test_destination_inside_phone_is_rejected`, `test_missing_phone_is_reported`, `test_missing_folders_is_reported`, `test_sort_modes` |
+| `tests/test_fileops.py` | 8 | `test_copy_file_atomic_copies_content_and_mtime`, `test_copy_file_atomic_overwrites_only_after_success`, `test_failed_copy_preserves_destination_and_cleans_temp`, `test_copy_stream_atomic_verifies_size`, `test_unique_path`, `test_atomic_write_json`, `test_is_same_file_uses_size_and_mtime`, `test_human_size` |
+| `tests/test_naming.py` | 14 | `test_parses_compact_date_and_time`, `test_parses_dashed_time`, `test_parses_dotted_time`, `test_whatsapp_style_name_has_no_fake_time`, `test_repairs_old_midnight_prefix`, `test_no_date_returns_none`, `test_invalid_date_returns_none`, `test_strip_multiple_generated_prefixes`, `test_target_name_is_idempotent`, `test_target_path_modes`, `test_date_for_path_falls_back_to_mtime`, `test_exif_datetime_is_read_and_counted`, `test_filename_still_wins_over_exif`, `test_date_with_source_falls_back_to_mtime` |
+| `tests/test_packaging.py` | 6 | `test_icon_is_a_real_png`, `test_desktop_file_points_at_the_icon`, `test_desktop_file_has_a_single_main_category`, `test_appstream_metadata_exists_and_is_built`, `test_spec_includes_icon_and_flet_data`, `test_version_is_consistent` |
+| `tests/test_storage.py` | 8 | `test_settings_defaults_and_merge`, `test_profile_round_trip`, `test_state_round_trip`, `test_state_is_persistent_across_instances`, `test_legacy_json_state_is_migrated_without_deleting_it`, `test_save_state_accepts_a_set`, `test_locked_database_is_not_treated_as_corrupt`, `test_app_data_dir_is_created` |
+| `tests/test_takeout.py` | 13 | `test_loose_file_uses_sidecar_timestamp_and_preserves_metadata`, `test_supplemental_metadata_sidecar_is_found`, `test_zip_supplemental_metadata_sidecar_is_found`, `test_rerun_is_idempotent`, `test_zip_is_streamed_and_sidecar_is_preserved`, `test_overwrite_does_not_lose_files_with_colliding_targets`, `test_metadata_can_be_disabled`, `test_input_folder_inside_destination_is_processed`, `test_invalid_zip_is_reported_without_crashing`, `test_sidecar_failure_is_counted`, `test_no_matching_media`, `test_cancel_before_processing`, `test_bad_json_is_ignored` |
+| `tests/test_telemetry.py` | 6 | `test_event_shape_and_percentage`, `test_legacy_three_argument_callback_still_works`, `test_indeterminate_defaults_for_zero_totals`, `test_backup_emits_phases_and_additive_result_fields`, `test_takeout_emits_zip_counts_and_date_sources`, `test_dedup_logs_exact_duplicate_bytes_before_moving` |
+| `tests/test_wifi_server.py` | 13 | `test_accepts_normal_relative_path`, `test_rejects_traversal`, `test_rejects_absolute_and_drive`, `test_rejects_hidden_and_partial`, `test_diffs_manifest_against_state`, `test_legacy_size_none_row_is_trusted`, `test_mtime_tolerance`, `test_media_filter_and_unsafe_ignored`, `test_duplicates_ignored`, `test_moves_file_from_staging_to_dest`, `test_second_run_skips`, `test_flat_staging_fallback`, `test_missing_staging_returns_error` |
+
+### Privacy note for the run
+
+Every test that touches settings/profiles/state patches `XDG_CONFIG_HOME` to a `tempfile.TemporaryDirectory` (`tests/test_storage.py:27-35`, `test_engine.py:18-23`, `test_takeout.py:18-23`, `test_wifi_server.py:106-114`, `test_telemetry.py:64-72`). `tests/test_dedup.py`, `test_naming.py`, `test_fileops.py`, `test_cli.py`, and `test_packaging.py` use temp dirs or pure functions. No test read or wrote the real `~/.config/SyncUp/`. `tests/fixtures/legacy/` currently contains only a README stating the directory is for synthetic/redacted fixtures.
+
+### Coverage gaps exposed by the inventory
+
+- **No HTTP route tests.** There is no `TestClient` usage anywhere; `/manifest`, `/upload`, `/complete`, `/status`, and the mobile page are untested at the HTTP layer (`grep` for `TestClient|/manifest|/upload|/complete|/status|create_app` in `tests/` returns nothing).
+- **No `BackupSession` or `WiFiServer` lifecycle tests** — state transitions, 409/400 branches, port scanning, readiness, stop/force-exit, and staging cleanup are untested.
+- **No QR / LAN-IP helper tests** — `generate_qr_svg`, `qr_image_source`, `get_local_ip`, `is_lan_address`, `create_staging_dir`, `_prune_stale_directories` are untested.
+- **No `core/device.py` tests** — MTP discovery and folder listing have no coverage at all.
+- **No view-behaviour tests** beyond `views/common.py` helpers; phone/organizer/dedup/wifi view flows are untested.
+- **No `main.py`, `core/logging_setup.py`, or `core/cli` integration tests** beyond argv sanitisation.
+- **No Windows/macOS tests** and no real-device, real-phone, or real-LAN tests.
+- **No security tests** because auth/TLS/expiry do not exist.
+
+Lint (`ruff check .`) and the packaged build (`build.sh`) were **not run** in this chunk; A4’s required verification was the test baseline. CI defines both, so Phase 1 should run them as its first gate.
+
+## A4.5 Feature inventory (final table)
+
+Evidence categories: **Automated** = covered by a named legacy test; **Manual** = not run in this audit unless stated; **Unknown** = cannot be determined without hardware/user data.
+
+| Feature | Files | Evidence it works | Notes |
+|---|---|---|---|
+| USB/MTP phone backup | `core/device.py`, `core/engine.py`, `views/phone_view.py` | Automated: `tests/test_engine.py` (14 tests) with a synthetic phone tree covers copy, skip, modified, conflict modes, overlapping folders, filters, cancel, legacy state, destination guard, missing inputs, sort modes. Device discovery itself has **no tests**. Manual: not run (no device). | Linux-only GVFS/GIO discovery; real MTP transfer, lazy mount, and disconnect handling are **unverified** here. |
+| Wi-Fi backup | `core/wifi_server.py`, `core/wifi_models.py`, `core/wifi_telemetry.py`, `core/engine.py` (`run_wifi_backup`), `views/wifi_view.py` | Automated: `tests/test_wifi_server.py` (13 tests) covers path validation, manifest diff, legacy rows, mtime tolerance, filters, duplicates, staging→dest move, second-run skip, flat fallback, missing staging. HTTP routes, session lifecycle, QR, server start/stop, and real-phone flow are **untested**. Manual: not run. | Plain HTTP, no auth/TLS/expiry (A4.2); all clients share `"wifi-backup"` state. |
+| Google Takeout / loose-folder organizer | `core/takeout_engine.py`, `views/organizer_view.py` | Automated: `tests/test_takeout.py` (13 tests) covers sidecar timestamps, supplemental metadata, ZIP streaming, idempotent re-run, sidecar preservation, overwrite collisions, metadata off, input-inside-destination, invalid ZIP, sidecar failure, no media, cancel, bad JSON. Manual: not run with a real Takeout archive. | ZIP members fall back to member timestamp (no EXIF); no ZIP-bomb/expansion limits; no EXIF write-back. |
+| Duplicate finder | `core/dedup_engine.py`, `views/dedup_view.py` | Automated: `tests/test_dedup.py` (9 tests) covers preview-no-move, manifest-before-move, undo, no duplicates, cancel, malformed manifest, missing manifest, `_Duplicates_` exclusion, no-overwrite undo. Manual: not run on a large library. | Moves, never deletes; undo trusts manifest paths; cross-filesystem move is not atomic. |
+| Settings | `core/storage.py`, `core/constants.py`, `main.py` | Automated: `tests/test_storage.py::test_settings_defaults_and_merge`; atomic JSON write via `tests/test_fileops.py::test_atomic_write_json`. Manual: not run. | Global `settings.json`; unknown keys preserved; only `theme`, `window_width`, `window_height` are consumed. |
+| Device profiles | `core/storage.py`, `views/phone_view.py`, `views/wifi_view.py` | Automated: `tests/test_storage.py::test_profile_round_trip`. View-level folder/selection persistence is **untested**. Manual: not run. | `destination`/`sorting`/`filter`/`conflict`/`folders`; Wi-Fi never writes `folders`; `_safe_id` is lossy (A3 R3). |
+| Theming | `main.py` (`toggle_theme`, startup `theme_mode`), `views/common.py` (`level_color`) | Automated: `tests/test_common.py::test_level_colors_switch_with_theme`; theme toggle/persistence is **untested**. Manual: not run. | Only dark/light; a non-`"light"` value maps to dark. **No “System” theme mode**, despite SPEC §E asking for it. |
+| Window persistence | `main.py` (`page.window.*`, `on_close`), `core/storage.py` | Automated: only key defaults/merge; `on_close` geometry save is **untested**. Manual: not run. | 1200×950 default, min 1000×700; save is best-effort inside `try/except`. |
+| Activity log / progress UI | `main.py` (`log_col`, queues, consumers), `views/common.py` | Automated: `tests/test_common.py` covers job-button lifecycle, error-line cap, progress callback bridging; telemetry shape in `tests/test_telemetry.py`. Manual: not run. | Log capped at 800 rows; latest-progress-wins coalescing; worker/UI queues (A1.2). |
+| Completion sound | `main.py` (`_play_ding`/`play_ding`) | No tests. Manual: not run. | Windows `winsound`, macOS `afplay`, Linux `canberra-gtk-play`; failures swallowed; only Linux path validated historically. |
+| Packaging | `SyncUp.spec`, `build.sh`, `packaging/`, `assets/` | Automated: `tests/test_packaging.py` (6 tests) checks icon, desktop entry, appdata, spec contents, version consistency. Build itself **not run**. | Linux AppImage only; no Windows/macOS artifacts. |
+| Telemetry | `core/telemetry.py`, `core/wifi_telemetry.py` | Automated: `tests/test_telemetry.py` (6 tests) covers event shape, 3-arg compatibility, indeterminate totals, engine/takeout/dedup events. | Schema v1 is a wire marker; no consumer validates `version`; no throttling. |
+| Logging | `core/logging_setup.py` | No tests. Manual: not run. | Rotating `syncup.log`, 2 MB × 3, no console handler. |
+
+## A4.6 Top 10 migration risks
+
+Ordered by severity. Each risk is grounded in the evidence above; related A2/A3 IDs are cross-referenced rather than restated.
+
+1. **Wi-Fi is an unauthenticated, plaintext, unrestricted write path (A4.2).** No auth/token/pairing, no TLS, `0.0.0.0`, self-service manifest, no size/rate/expiry limits, single global session. Porting it as-is violates SPEC §5B and the standing “never expose an unrestricted upload endpoint” rule. v2 must implement pairing tokens, short-lived sessions, expiry, Host/Origin checks, request/upload limits, and safe staging before claiming Wi-Fi support.
+2. **SQLite migration is WAL-sensitive and has no schema version (A3 R1/R5).** A plain `.db` copy can miss committed rows in `-wal`; a crash mid-migration is indistinguishable from “never migrated”. v2 must use the SQLite backup API (`Connection::backup` / `VACUUM INTO`), add `user_version`/a ledger, make migration idempotent and resumable, and verify the backup.
+3. **The tri-state `processed` row contract must survive bit-for-bit (A3 R2).** `size IS NULL` means “trusted forever”; `size`-only means “size match”; both set means “size + 2 s mtime”. Normalising `NULL` to `0`, adding `NOT NULL`, or synthesising `copied_at` will either re-copy whole libraries or falsely mark changed files as backed up. Preserve nanoseconds and exact `NULL`s.
+4. **The atomic-publish pipeline is weaker than the stated invariant (A2.3).** `fsync` failures are swallowed, there is no directory fsync after `os.replace`, and verification is size-only. v2 must enforce durable publish (file + parent directory) and, where required, content verification **before** the DB commit, per the safety invariants.
+5. **USB/MTP is Linux-only and untested at the device layer (A4.3).** `core/device.py` hard-codes `gio`/GVFS and Linux mount paths; there is no Windows/macOS implementation and no test for discovery. v2 needs a platform abstraction and independent verification; Linux success must not be reported as cross-platform support.
+6. **Business logic is embedded in the views (A4.1).** Staging creation/pruning, QR generation, server lifecycle, profile persistence, confirmation gating, and device polling live in `views/`. A Svelte/Rust split must move these into services/domain and re-enforce them in Rust; otherwise invariants will depend on the frontend.
+7. **The two backup engines will drift (A2.1/A2.3).** `run_backup` and `run_wifi_backup` are ~450 near-identical lines; the 2-second mtime tolerance is defined in three places; `_matches_filter` and `_format_duration` are duplicated. A single Rust backup pipeline should own conflict, staging, state, and durability semantics.
+8. **Device identity is lossy and Wi-Fi state is shared (A3 R3, A4.2).** `_safe_id` can collide, the original ID is unrecoverable, and every Wi-Fi client writes the `"wifi-backup"` namespace. Migration must treat filenames as opaque legacy keys, detect collisions, and isolate per-device/per-session state; otherwise files can be wrongly skipped.
+9. **The green baseline does not cover the riskiest surfaces (A4.4).** 105 tests pass, but there are no HTTP route tests, no `BackupSession`/`WiFiServer` tests, no MTP tests, no view-flow tests, and no Windows/macOS tests. v2 needs equivalent Rust tests for file ops, state, migration, organizer, dedup, and Wi-Fi auth/session before parity can be claimed.
+10. **Date/EXIF behaviour has documented limits that must be an explicit decision (A2.3/A2.4.1).** EXIF is read only for JPEG APP1/TIFF; HEIC/HEIF/PNG/WebP/RAW and ZIP members are not EXIF-probed; dates are naive local time. Preserve the current precedence for parity, or document each improvement as an intentional deviation with tests.
+
+### A4 open questions / not determinable from source
+
+- **Real MTP device behaviour** (mount timing, disconnect recovery, folder permissions) — no Android device was attached; `core/device.py` has no tests.
+- **Real phone/browser behaviour over a LAN** — no phone was used; the mobile page’s `webkitdirectory` support, retry behaviour, and firewall interaction are unverified.
+- **Production data shape** (row counts, `NULL`-row prevalence, live WAL state, legacy-JSON-only users) — cannot be known without reading user data, which is forbidden.
+- **Windows/macOS behaviour** — code branches exist but were never run; no CI or packaging exists for those platforms.
+- **Exact request-body limits imposed by the installed Starlette/Uvicorn versions** — the application defines none, and defaults were not measured.
+- **Whether `UploadFile.size` is always populated** by the installed FastAPI/Starlette version — the code treats it as optional (`getattr(file, "size", None)`).
+- **Lint and packaged-build status** — `ruff check .` and `build.sh` were not run in A4; only the test baseline was required.
