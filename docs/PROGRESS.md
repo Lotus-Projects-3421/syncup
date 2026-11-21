@@ -2,7 +2,7 @@
 
 ## Current phase: 4 (File Safety Engine and Jobs)
 ## Completed phases: 0 (Audit), 1 (Planning), 2 (Foundation), 3 (Storage)
-## Last commit: feat: phase 3 storage and legacy data migration
+## Last commit: chore: update generated ipc bindings for phase 3
 
 ## Pinned toolchain
 - rustc: 1.100.0
