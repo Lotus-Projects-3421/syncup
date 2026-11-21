@@ -1,18 +1,18 @@
 # SyncUp v2 — Progress Log
 
-## Current phase: 3 (Storage & Legacy Data Migration)
-## Completed phases: 0 (Audit), 1 (Planning), 2 (Foundation)
-## Last commit: feat: phase 2 foundation and app shell
+## Current phase: 4 (File Safety Engine and Jobs)
+## Completed phases: 0 (Audit), 1 (Planning), 2 (Foundation), 3 (Storage)
+## Last commit: feat: phase 3 storage and legacy data migration
 
 ## Pinned toolchain
 - rustc: 1.100.0
 - cargo: 1.100.0
-- node: v24.22.3 (updated from .nvmrc during Phase 2)
+- node: v24.22.3
 - npm: 11.19.1
 - gio: 2.80.0
 
 ## Handoff for next session
 - Paste this section at the top of the next OpenCode session.
-- State: Phase 2 is complete. The app shell, themes, and Specta IPC are working. DB pool is connected but creates no tables yet.
-- Next action: Create the v2 DB schema, WAL-safe backup, and migration scripts.
-- MUST READ FIRST: docs/PLAN.md §3, §5, and §8 (Phase 3).
+- State: Phase 3 is complete. DB schema v2, settings, profiles, and the WAL-safe legacy migration are fully implemented and tested.
+- Next action: Build the atomic, verified file-operation engine (copy_verified) and job foundation.
+- MUST READ FIRST: docs/PLAN.md §6 (File-safety invariants) and §8 (Phase 4).
