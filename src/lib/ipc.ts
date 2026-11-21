@@ -7,9 +7,30 @@ import type { InvokeOptions } from "@tauri-apps/api/core";
 export const commands = {
 	appVersion: (options?: InvokeOptions) => __TAURI_INVOKE<string>("app_version", undefined, options),
 	healthCheck: (options?: InvokeOptions) => __TAURI_INVOKE<HealthStatus>("health_check", undefined, options),
+	migrateLegacyImport: (sourceDbPath: string | null, sourceJsonDir: string | null, options?: InvokeOptions) => __TAURI_INVOKE<MigrationReport>("migrate_legacy_import", { sourceDbPath, sourceJsonDir }, options),
+	getMigrationStatus: (options?: InvokeOptions) => __TAURI_INVOKE<MigrationStatus_Serialize>("get_migration_status", undefined, options),
+	getSettings: (options?: InvokeOptions) => __TAURI_INVOKE<AppSettings>("get_settings", undefined, options),
+	updateSettings: (settings: AppSettings, options?: InvokeOptions) => __TAURI_INVOKE<null>("update_settings", { settings }, options),
+	listProfiles: (options?: InvokeOptions) => __TAURI_INVOKE<DeviceProfile[]>("list_profiles", undefined, options),
+	saveProfile: (profile: DeviceProfile, options?: InvokeOptions) => __TAURI_INVOKE<null>("save_profile", { profile }, options),
 };
 
 /* Types */
+export type AppSettings = {
+	theme: string,
+	windowWidth: number,
+	windowHeight: number,
+};
+
+export type DeviceProfile = {
+	id: string,
+	destination: string,
+	sorting: string,
+	filter: string,
+	conflict: string,
+	folders: string[],
+};
+
 export type HealthStatus = {
 	ok: boolean,
 	appVersion: string,
@@ -25,4 +46,36 @@ export type HealthStatus = {
 export type IpcError = {
 	code: string,
 	message: string,
+};
+
+export type MigrationReport = {
+	success: boolean,
+	alreadyMigrated: boolean,
+	dbRowsImported: number,
+	dbRowsSkipped: number,
+	jsonRecordsImported: number,
+	profilesImported: number,
+	settingsImported: boolean,
+	snapshotPaths: string[],
+	message: string,
+};
+
+export type MigrationStatus = MigrationStatus_Serialize | MigrationStatus_Deserialize;
+
+export type MigrationStatus_Deserialize = {
+	isMigrated: boolean,
+	schemaVersion: number,
+	processedCount: number,
+	profilesCount: number,
+	hasSettings: boolean,
+	importedAt?: string | null,
+};
+
+export type MigrationStatus_Serialize = {
+	isMigrated: boolean,
+	schemaVersion: number,
+	processedCount: number,
+	profilesCount: number,
+	hasSettings: boolean,
+	importedAt: string | null,
 };
