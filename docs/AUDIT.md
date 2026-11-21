@@ -633,3 +633,479 @@ Event shape (schema version 1):
 - **No job-history persistence** beyond the `processed` table.
 - **No throttling in the telemetry emitter** (relies on UI coalescing).
 - **No dedicated `scripts/` directory** (already noted in A1.4; not referenced by `core/`).
+
+---
+
+# Audit chunk A3 — persistence internals (schema, WAL, config formats, migration surface)
+
+> Scope: deeper persistence detail than A2.2. Every fact below was derived **only** from source code that reads/writes these files (`core/storage.py`, `core/engine.py`, `core/wifi_server.py`, `core/constants.py`, `core/fileops.py`, `main.py`, `views/phone_view.py`, `views/wifi_view.py`, `tests/test_storage.py`). No real file under `~/.config/SyncUp/` was read, listed, copied, or opened. All JSON examples are **SYNTHETIC**.
+>
+> Relationship to A2.2: A2.2 gives the storage summary and compatibility contract. A3.1–A3.7 add full DDL, exact file paths, exact synthetic shapes, migration mechanics, and the literal queries with line numbers. Where A2.2 already states a fact, A3 references it rather than repeating the rationale.
+
+## A3.1 SQLite schema (full DDL)
+
+### Where the schema is created
+
+- **Only one schema site exists in the entire repo**: `core/storage.py:120-137` (`StateStore._connect`). Repo-wide search for `CREATE TABLE`, `executescript`, `sqlite3.connect`, `PRAGMA`, and `user_version` found no other schema owner.
+- The same DDL is duplicated verbatim in the corruption-recovery branch at `core/storage.py:166-178`. There is no `CREATE INDEX`, no `ALTER TABLE`, no trigger, no view, and no `executescript`.
+- One database **per device/profile**: `state_<safe_id>.db` (`core/storage.py:115`). There is no shared/global database.
+
+### Full DDL — every table, every column
+
+```sql
+-- core/storage.py:126-135 (normal path) and :167-176 (corrupt-DB fallback path)
+CREATE TABLE IF NOT EXISTS processed (
+    rel_path TEXT PRIMARY KEY,
+    size INTEGER,
+    mtime INTEGER,
+    copied_at TEXT
+)
+```
+
+That is the **complete** schema. There are **no** other tables.
+
+| Column | Declared type | Constraints / defaults | Semantics |
+|---|---|---|---|
+| `rel_path` | `TEXT` | `PRIMARY KEY` (implies `NOT NULL` + unique) | Source path relative to the phone storage root (MTP) or Wi-Fi staging root, POSIX-style for Wi-Fi (`as_posix()`), OS-native string for MTP (`str(...relative_to...)`) |
+| `size` | `INTEGER` | nullable, no default | Source byte size at copy time. `NULL` = legacy path-only row |
+| `mtime` | `INTEGER` | nullable, no default | Source `st_mtime_ns` at copy time (**nanoseconds**). `NULL` = legacy/intermediate row |
+| `copied_at` | `TEXT` | nullable, no default | Local ISO-8601 with second precision, `datetime.now().isoformat(timespec="seconds")` (`core/storage.py:243`) |
+
+- No `NOT NULL` constraints, no `DEFAULT` clauses, no `CHECK`, no `FOREIGN KEY`, no `STRICT` table, no `WITHOUT ROWID`.
+- SQLite type affinity only: `TEXT`, `INTEGER`, `TEXT`.
+
+### Full DDL — every index
+
+There are **no explicit `CREATE INDEX` statements**. The only index is the implicit unique index SQLite creates for `rel_path TEXT PRIMARY KEY` (`sqlite_autoindex_processed_1`). Consequences:
+
+- Exact `rel_path` equality lookups are index-backed.
+- `MIN(copied_at)` (`core/storage.py:217-219`) is a full-table scan (no index on `copied_at`).
+- `load()` reads **every row** (`core/storage.py:206-208`); callers then build an in-memory dict and do exact-key lookups. The PK does not reduce that full read.
+
+### Schema-versioning mechanism
+
+- **None.** No `PRAGMA user_version` read or write anywhere. No `migrations` / `schema_version` table. No version constant for the DB. Repo-wide grep for `user_version` returned zero hits.
+- The only idempotent upgrade primitive is `CREATE TABLE IF NOT EXISTS`. There is no mechanism to add a column to an existing `processed` table.
+- Consequence for v2: there is no way to distinguish "v1 schema, fully migrated" from "v1 schema, never touched" or "partially migrated". A3.5 and A3.7 expand on this.
+
+### Complete SQL statement inventory (v1.4.1)
+
+| Purpose | Statement | Location |
+|---|---|---|
+| Open connection | `sqlite3.connect(str(self.db_path), timeout=30)` | `core/storage.py:123`, `:166` |
+| Journal mode | `PRAGMA journal_mode=WAL` | `core/storage.py:124` |
+| Sync level | `PRAGMA synchronous=NORMAL` | `core/storage.py:125` |
+| Create schema | `CREATE TABLE IF NOT EXISTS processed (...)` | `core/storage.py:126-135`, `:167-176` |
+| Legacy import | `INSERT OR IGNORE INTO processed(rel_path, size, mtime, copied_at) VALUES(?, ?, ?, ?)` | `core/storage.py:197-201` |
+| Load all | `SELECT rel_path, size, mtime FROM processed` | `core/storage.py:206-208` |
+| Oldest timestamp | `SELECT MIN(copied_at) FROM processed WHERE copied_at IS NOT NULL` | `core/storage.py:217-219` |
+| Upsert one row | `INSERT INTO processed(...) VALUES(?, ?, ?, ?) ON CONFLICT(rel_path) DO UPDATE SET size=excluded.size, mtime=excluded.mtime, copied_at=excluded.copied_at` | `core/storage.py:234-244` |
+| Commit | `Connection.commit()` | `core/storage.py:136`, `:202`, `:246`, `:250`, `:255` |
+
+## A3.2 WAL and journal mode findings
+
+**WAL is enabled: YES**, on the normal connection path, at `core/storage.py:124`:
+
+```python
+conn = sqlite3.connect(str(self.db_path), timeout=30)
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("PRAGMA synchronous=NORMAL")
+```
+
+Details that matter for a safe v2 migration:
+
+1. **WAL is a persistent database property.** Once written, it is recorded in the DB header. Opening the DB read-only still shows `journal_mode=wal`.
+2. **`synchronous=NORMAL`** (not `FULL`) accompanies WAL. With WAL, `NORMAL` can lose the most recent committed transactions after a power loss (the DB stays consistent; it rolls back). A migration must not assume the newest `copied_at` rows survived a hard crash.
+3. **The corruption-recovery reconnect does NOT set the pragmas** (`core/storage.py:166-178`): it calls `sqlite3.connect(...)`, runs only `CREATE TABLE IF NOT EXISTS`, and returns. A freshly recreated DB after corruption therefore uses SQLite defaults (`journal_mode=delete`, `synchronous=FULL`) until the next normal `StateStore` construction applies WAL again.
+4. **The return value of `PRAGMA journal_mode=WAL` is not checked.** If the filesystem refuses WAL (e.g. some network/FUSE mounts), the code does not notice or report it.
+5. **No checkpoint policy, no `wal_checkpoint`, no `VACUUM`.** `-wal`/`-shm` files persist for the life of the DB.
+6. **Backup implication (definitional):** a plain file copy of `state_<id>.db` alone can miss committed data still in `-wal`. v2 must use `rusqlite::Connection::backup` / `VACUUM INTO` on a live connection, or checkpoint + copy the DB **and** its `-wal`/`-shm` as a set. The v1 corruption path (`os.replace` of the DB and sidecars) is a rename, not a SQLite backup, and must not be ported as-is (already flagged in A2.2).
+7. **Concurrency:** each `StateStore` owns one connection with an `RLock`; Wi-Fi creates a new `StateStore` per request (`core/wifi_server.py:687-700`), while the engine keeps one open for a run. Cross-connection safety depends on SQLite locking and the 30 s busy timeout. There is no `PRAGMA busy_timeout`; the timeout is supplied by `sqlite3.connect(timeout=30)`.
+
+## A3.3 Configuration file formats (synthetic examples)
+
+All three formats are plain UTF-8 JSON. Settings and profiles are written by `core/fileops.py:194-210` (`atomic_write_json`): temp file `.<name>.part-<pid>-<10hex>` in the same directory, `json.dump(..., indent=2, ensure_ascii=False)`, flush, best-effort `fsync`, then `os.replace`. There is no schema validation on write.
+
+### A3.3.1 `settings.json`
+
+Path: `<app_data_dir>/settings.json` (`core/storage.py:51`, `:66`).
+
+| Key | Type | Default | Read by | Written by |
+|---|---|---|---|---|
+| `theme` | string, exactly `"dark"` or `"light"` (any other value is treated as dark) | `"dark"` | `main.py:61,65-69` | `main.py:176-189` (theme toggle) |
+| `window_width` | integer (Flet window width) | `1200` | `main.py:74` | `main.py:496-506` (`on_close`) |
+| `window_height` | integer (Flet window height) | `950` | `main.py:75` | `main.py:496-506` (`on_close`) |
+
+- Defaults live in `core/constants.py:21-25` (`DEFAULT_SETTINGS`).
+- `load_global_settings` (`core/storage.py:49-61`) starts from `{}`, reads the file only if it exists and parses to a dict, and returns `{**DEFAULT_SETTINGS, **data}`. **Unknown keys survive**; malformed JSON / non-dict / `OSError` silently yields `{}` then defaults.
+- `save_global_settings` (`core/storage.py:64-66`) writes the **entire in-memory dict** (including unknown keys) under a module `RLock`, atomically. The app holds one dict for the process lifetime, so a concurrent external edit can be overwritten.
+- No per-device settings exist; `settings.json` is global.
+
+**SYNTHETIC example** (not from any real user file):
+
+```json
+{
+  "window_width": 1200,
+  "window_height": 950,
+  "theme": "dark"
+}
+```
+
+### A3.3.2 `profile_<safe_id>.json`
+
+Path: `<app_data_dir>/profile_<safe_id>.json` (`core/storage.py:74-75`). `safe_id` is `_safe_id(device_id)` (`core/storage.py:69-71`): keep only alphanumerics, `-`, `_`; fall back to `"default"`. The Wi-Fi tab always uses the literal device id `"wifi-backup"` (`views/wifi_view.py:45`), i.e. `profile_wifi-backup.json`.
+
+| Key | Type | Default when absent/invalid | Read by | Written by |
+|---|---|---|---|---|
+| `destination` | string (absolute destination folder) | `""` | `views/phone_view.py:279`; `views/wifi_view.py:187` | Phone: `views/phone_view.py:402-411`; Wi-Fi: `views/wifi_view.py:403-413` |
+| `sorting` | string enum: `"day"`, `"month"`, `"year"`, `"flat"` | `"year"` | `views/phone_view.py:280-283`; `views/wifi_view.py:188-190` | same as above |
+| `filter` | string enum: `"both"`, `"photos"`, `"videos"` | `"both"` | `views/phone_view.py:284-287`; `views/wifi_view.py:191-193` | same as above |
+| `conflict` | string enum: `"keep"`, `"overwrite"` | `"keep"` | `views/phone_view.py:288-291`; `views/wifi_view.py:194-196` | same as above |
+| `folders` | array of strings (phone-relative folder names, leading `/` stripped on read) | `[]` (empty set) | `views/phone_view.py:292-300` | **Phone only**: `views/phone_view.py:402-411`. Wi-Fi never writes `folders` |
+
+- `load_profile` (`core/storage.py:78-87`) returns `None` for missing file, malformed JSON, `OSError`, or non-dict. It performs **no key/type validation**.
+- Enum validation happens in the views, not in storage: invalid `sorting`/`filter`/`conflict` fall back to `year`/`both`/`keep`; `folders` is coerced with `str(...).strip("/")` and empties are dropped.
+- `save_profile` (`core/storage.py:90-92`) writes exactly the keys the caller passes and **replaces the whole file** atomically. Phone saves all five keys; Wi-Fi saves four (no `folders`).
+- `destination` is stored verbatim; it is **not** validated or made absolute at persistence time.
+
+**SYNTHETIC phone profile** (`profile_mtp-example-device.json`; not from any real user file):
+
+```json
+{
+  "destination": "/home/example/Pictures/PhoneBackup",
+  "sorting": "day",
+  "filter": "both",
+  "conflict": "keep",
+  "folders": [
+    "DCIM/Camera",
+    "Pictures/Screenshots"
+  ]
+}
+```
+
+**SYNTHETIC Wi-Fi profile** (`profile_wifi-backup.json`; not from any real user file):
+
+```json
+{
+  "destination": "/home/example/Pictures/WiFiBackup",
+  "sorting": "year",
+  "filter": "photos",
+  "conflict": "overwrite"
+}
+```
+
+### A3.3.3 `state_<safe_id>.json` (legacy)
+
+Path: `<app_data_dir>/state_<safe_id>.json` (`core/storage.py:99-101`).
+
+| Property | Value |
+|---|---|
+| Shape | A JSON **array of strings** (path-only processed list). Anything that is not a list is ignored |
+| Element type | Coerced with `str(entry)` at import (`core/storage.py:193`) |
+| Default | No file = nothing imported |
+| Written by | **Nothing in v1.4.1.** No writer exists in the repo; it is read-only legacy input |
+| Read by | `StateStore._migrate_legacy_json` (`core/storage.py:180-202`), invoked from `StateStore.__init__` (`core/storage.py:118`) on **every** construction, including every Wi-Fi request |
+
+- Imported rows get `size = NULL`, `mtime = NULL`, `copied_at = NULL` (`core/storage.py:193`) and are inserted with `INSERT OR IGNORE` (`core/storage.py:197-201`).
+- The file is **never deleted, renamed, or truncated**.
+- Unreadable/malformed JSON and non-list values are silently ignored (`core/storage.py:187-191`).
+- Duplicate strings collapse to one row via the primary key.
+
+**SYNTHETIC example** (not from any real user file):
+
+```json
+[
+  "DCIM/Camera/IMG_0001.jpg",
+  "DCIM/Camera/IMG_0002.mp4",
+  "Pictures/Screenshots/Screenshot_20260101.png"
+]
+```
+
+### A3.3.4 Related non-JSON persistence
+
+| File | Shape | Writer |
+|---|---|---|
+| `state_<safe_id>.db` | SQLite, `processed` table (A3.1) | `StateStore.mark` / `commit` |
+| `state_<safe_id>.db-wal`, `-shm` | SQLite WAL sidecars | SQLite (WAL mode) |
+| `state_<safe_id>.db.corrupt-<time_ns>` | Renamed damaged DB | `StateStore._connect` (`core/storage.py:155-165`) |
+| `state_<safe_id>.db.corrupt-<time_ns>-wal` / `-shm` | Renamed sidecars | same |
+| `logs/syncup.log` (+ rotations) | Text log, `RotatingFileHandler` | `core/logging_setup.py` |
+| `_Duplicates_<epoch>/_manifest.json` | Dedup undo manifest, **in the scan destination tree**, not in the config dir | `core/dedup_engine.py` |
+
+## A3.4 Legacy file locations (for migration)
+
+### The exact directory
+
+All persistent user files live in **one directory**, created by `get_app_data_dir()` (`core/storage.py:25-35`):
+
+```
+<app_data_dir> = <platform config base> / "SyncUp"
+```
+
+| Platform | `<platform config base>` | Resulting `<app_data_dir>` |
+|---|---|---|
+| Linux | `$XDG_CONFIG_HOME` if set, else `~/.config` | `$XDG_CONFIG_HOME/SyncUp` or `~/.config/SyncUp` |
+| Windows | `%APPDATA%` if set, else `~/AppData/Roaming` | `%APPDATA%\SyncUp` |
+| macOS | `~/Library/Application Support` | `~/Library/Application Support/SyncUp` |
+
+- The directory is created eagerly (`mkdir(parents=True, exist_ok=True)`, `core/storage.py:34`), so a bare `settings.json` load creates it even before any backup.
+- Linux/macOS/Windows branches exist; only Linux was validated for v1.4.1 (A1.4).
+
+### Paths relative to the SQLite DB
+
+For a given device `safe_id`, the DB is `state_<safe_id>.db` **directly inside `<app_data_dir>`** (`core/storage.py:115`). Every other file is a **sibling in the same directory**:
+
+```
+<app_data_dir>/
+├── settings.json                         # global settings
+├── profile_<safe_id>.json                # one per device/profile
+├── state_<safe_id>.db                    # SQLite backup state
+├── state_<safe_id>.db-wal                # WAL sidecar (when WAL active)
+├── state_<safe_id>.db-shm                # shared-memory sidecar
+├── state_<safe_id>.db.corrupt-<ns>       # renamed damaged DB, if recovery ran
+├── state_<safe_id>.db.corrupt-<ns>-wal   # renamed sidecar, if recovery ran
+├── state_<safe_id>.json                  # LEGACY path-only JSON (import only)
+├── .<name>.part-<pid>-<10hex>            # possible leftover atomic-write temp
+└── logs/
+    └── syncup.log                        # + rotated backups
+```
+
+Migration-relevant facts:
+
+1. **`state_<safe_id>.json` sits next to `state_<safe_id>.db`**, not in a subdirectory. A migration that enumerates `<app_data_dir>/state_*.json` and `<app_data_dir>/state_*.db` finds both.
+2. **`profile_<safe_id>.json` shares the same `safe_id` namespace** as the state files, so `profile_X.json`, `state_X.db`, and `state_X.json` can be grouped by the same `X`. `settings.json` is unqualified/global.
+3. **The original device id cannot be reconstructed from the filename.** `_safe_id` is lossy (`core/storage.py:69-71`): `mtp://phone/` and `mtp_phone_` both become `mtpphone`; an all-punctuation id becomes `default`. Two devices can already share one file. Import must treat the filename suffix as the only device key and must detect collisions.
+4. **A legacy-only user may have `state_<safe>.json` with no `.db`.** `StateStore` creates the DB and imports the JSON on first open, so v2 discovery must look for the JSON independently of the DB.
+5. **Wi-Fi always uses `safe_id = "wifi-backup"`** (`views/wifi_view.py:45`), so its files are `profile_wifi-backup.json` / `state_wifi-backup.db` / `state_wifi-backup.json`.
+6. **Do not copy the DB alone while WAL is active** (A3.2). Migrate via a SQLite connection/backup API.
+7. **Temp-file debris** (`.settings.json.part-*`, `.profile_*.part-*`, `.state_*.part-*`) may remain after a crash; they are not valid inputs and must be ignored/cleaned, not parsed.
+8. **`state_*.db.corrupt-*` files are not the live DB.** They are preserved damaged copies; a migration must not treat them as current state.
+
+## A3.5 Existing migration logic
+
+### A3.5.1 JSON → SQLite state import
+
+The **only** migration code is `StateStore._migrate_legacy_json` (`core/storage.py:180-202`), called unconditionally from `StateStore.__init__` (`core/storage.py:118`).
+
+Sequence:
+
+1. Compute `state_<safe_id>.json` via `get_state_file` (`core/storage.py:181`).
+2. If absent, return.
+3. Read and `json.load`; on `OSError`/`JSONDecodeError`, return silently.
+4. If the parsed value is not a `list`, return silently.
+5. Build `rows = [(str(entry), None, None, None) for entry in entries]`.
+6. If empty, return.
+7. `executemany("INSERT OR IGNORE ...", rows)` then `commit()` (`core/storage.py:196-202`).
+
+Assessment:
+
+| Property | Finding |
+|---|---|
+| Transactional | **Yes, effectively.** `executemany` + `commit` is one implicit transaction; an interruption before commit rolls the batch back. `INSERT OR IGNORE` makes a retry safe. |
+| Idempotent | **Yes**, by `rel_path` primary key. Re-running inserts nothing new. |
+| Safe on interruption | **Yes for data loss** (the JSON is never modified), but **not detectable**: there is no completion marker. If the process dies mid-import, the next open simply retries. If the JSON is corrupt/unreadable, it is skipped **every** time with no error surfaced. |
+| Re-runs forever | **Yes.** It re-reads and re-parses the JSON on every `StateStore` construction, including every Wi-Fi HTTP request. Cheap for small files, unbounded for large ones. |
+| Preserves source | **Yes.** The JSON file is never deleted or rewritten. |
+| Validates rows | **No.** Elements are blindly `str()`-coerced; a dict becomes its repr, `None` becomes `"None"`. |
+| Schema upgrade | **None.** No column/table changes; only `CREATE TABLE IF NOT EXISTS`. |
+| Version gate | **None.** No `user_version`, no ledger. |
+
+### A3.5.2 Schema upgrades
+
+- There are **no** schema upgrade functions, no `ALTER TABLE`, and no version constants. A v1.4.1 DB is created with the schema in A3.1 and never altered.
+- The corrupt-DB branch (`core/storage.py:138-178`) is **not** a migration: it closes the connection, renames `state_<id>.db` (and any `-wal`/`-shm`) to `.corrupt-<time_ns>`, then creates a **fresh empty** DB. Old rows are not copied forward; the legacy JSON (if any) is re-imported on the next call. Rename failures are swallowed, and `OperationalError` (lock/permission/busy) is explicitly re-raised instead (`core/storage.py:141-147`).
+
+### A3.5.3 Settings and profile migration
+
+- **None.** `settings.json` and `profile_<id>.json` are read directly each time; there is no versioning, no conversion, and no default-backfill step beyond the read-time merges/fallbacks in A3.3.
+- Unknown keys in `settings.json` survive because of `{**DEFAULT_SETTINGS, **data}`; unknown profile keys are ignored by the views but not removed by storage unless a view rewrites the file (which replaces it with only its known keys).
+
+### A3.5.4 What v2 must add (per SPEC §6 and standing rules)
+
+- A schema version (`PRAGMA user_version` or a ledger table) and a resumable, idempotent migration with a completion record.
+- A verified SQLite backup before migration, using the SQLite API (WAL-aware), never a plain file copy.
+- Explicit handling/reporting of unreadable legacy JSON, instead of silent skip (SPEC: "must never silently skip files because the old state could not be read").
+- Preservation of `NULL` size/mtime semantics and of the original files.
+
+## A3.6 Backup-state queries (file:line)
+
+### (a) "Is this file already backed up?" queries
+
+**In-memory decision function (authoritative for phone + Wi-Fi engine runs)** — `core/engine.py:111-125`:
+
+```python
+def _is_processed(entry: dict | None, size: int, mtime_ns: int) -> bool:
+    """Decide whether a state row means this exact file is already safe."""
+    if entry is None:
+        return False
+    stored_size = entry.get("size")
+    if stored_size is None:
+        # Legacy row: the old app only stored paths.  Trust it to avoid
+        # re-copying an entire existing library.
+        return True
+    if stored_size != size:
+        return False
+    stored_mtime = entry.get("mtime")
+    if stored_mtime is None:
+        return True
+    return abs(stored_mtime - mtime_ns) <= 2_000_000_000
+```
+
+Call sites: phone scan `core/engine.py:273-279`; Wi-Fi scan `core/engine.py:732-737`.
+
+**The query that supplies that function's data** — `core/storage.py:204-212`:
+
+```python
+def load(self) -> dict[str, dict]:
+    with self._lock:
+        rows = self._conn.execute(
+            "SELECT rel_path, size, mtime FROM processed"
+        ).fetchall()
+    return {
+        rel_path: {"size": size, "mtime": mtime}
+        for rel_path, size, mtime in rows
+    }
+```
+
+Call sites: `core/engine.py:232` (phone), `core/engine.py:692` (Wi-Fi), `core/wifi_server.py:693-695` (per-request `_read_state`), `core/storage.py:269` (`load_state` compatibility helper).
+
+**Wi-Fi manifest diff equivalent** — `core/wifi_server.py:703-764`, specifically `:736-753`:
+
+```python
+        stored = state.get(rel)
+        status: str | None = None
+        if stored is None:
+            status = "new"
+        else:
+            stored_size = stored.get("size")
+            if stored_size is None:
+                # Legacy path-only row: the engine trusts it too.
+                continue
+            if int(stored_size) != entry.size:
+                status = "modified"
+            else:
+                stored_mtime = stored.get("mtime")
+                if (
+                    stored_mtime is not None
+                    and abs(int(stored_mtime) - entry.mtime_ns) > MTIME_TOLERANCE_NS
+                ):
+                    status = "modified"
+```
+
+`MTIME_TOLERANCE_NS = 2_000_000_000` (`core/wifi_server.py:51`). Route call site: `/manifest` at `core/wifi_server.py:1103-1108`.
+
+**Advisory "oldest backup" query** — `core/storage.py:214-222`:
+
+```python
+row = self._conn.execute(
+    "SELECT MIN(copied_at) FROM processed WHERE copied_at IS NOT NULL"
+).fetchone()
+```
+
+### (b) "Insert/update a backed-up record" queries
+
+**Normal upsert (after a verified publish)** — `core/storage.py:225-246`, SQL at `:234-244`:
+
+```python
+            self._conn.execute(
+                """
+                INSERT INTO processed(rel_path, size, mtime, copied_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(rel_path) DO UPDATE SET
+                    size = excluded.size,
+                    mtime = excluded.mtime,
+                    copied_at = excluded.copied_at
+                """,
+                (rel_path, size, mtime, datetime.now().isoformat(timespec="seconds")),
+            )
+            if commit:
+                self._conn.commit()
+```
+
+Call sites and timing:
+
+| Call site | When | Commit policy |
+|---|---|---|
+| `core/engine.py:471-476` | After `fileops.copy_file_atomic` returns (phone copy) | `commit=(processed % STATE_COMMIT_EVERY == 0)`, i.e. every 10th copied file |
+| `core/engine.py:428-432` | Existing destination adopted as identical (phone), **before** the skip | Default `commit=False` (flushed later) |
+| `core/engine.py:923-928` | After `copy_file_atomic` returns (Wi-Fi copy) | Every 10th copied file |
+| `core/engine.py:887-891` | Existing destination adopted as identical (Wi-Fi) | Default `commit=False` |
+| `core/storage.py:281,283,286` | `save_state` compatibility helper (tests only) | `store.commit()` after the loop |
+| `core/storage.py:248-257` | `commit()` / `close()` | Final flush; `close()` commits then closes |
+
+**Legacy bulk insert (path-only, `NULL` metadata)** — `core/storage.py:196-202`:
+
+```python
+        with self._lock:
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO processed(rel_path, size, mtime, copied_at) "
+                "VALUES(?, ?, ?, ?)",
+                rows,
+            )
+            self._conn.commit()
+```
+
+`STATE_COMMIT_EVERY = 10` is defined at `core/engine.py:57`. Consequence: a crash can lose up to 9 uncommitted state rows. That fails **safe** (re-copy) but means the v2 migration cannot assume the v1 DB records every file that was actually copied.
+
+## A3.7 Data-safety risks for v2 migration
+
+Ordered by severity; each is grounded in the code above.
+
+### R1 — WAL-aware backup is mandatory; a file copy is unsafe
+
+`PRAGMA journal_mode=WAL` (`core/storage.py:124`) means committed rows can live in `state_<id>.db-wal` at the moment of migration. A naive copy of the `.db` alone can silently omit recent backup history, and then v2 would re-copy (or, worse, mis-reconcile) files. **Required:** open the legacy DB and use `Connection::backup` / `VACUUM INTO`; verify the backup (integrity check + row count + representative rows); never modify the source; never treat a locked DB as corrupt (`OperationalError` is explicitly re-raised at `core/storage.py:141-147`).
+
+### R2 — The three-state row contract must be preserved bit-for-bit
+
+The skip logic distinguishes:
+
+- no row → not backed up;
+- `size IS NULL` → **trusted as backed up forever** (`core/engine.py:116-119`, `core/wifi_server.py:742-744`);
+- `size` set, `mtime IS NULL` → backed up if size matches (`core/engine.py:122-124`);
+- both set → size equal and `|mtime_ns delta| <= 2 s` (`core/engine.py:125`).
+
+If v2 normalises `NULL`s to `0`, adds `NOT NULL`, or "repairs" legacy rows, it will either re-copy entire libraries (safe but disruptive) or falsely mark changed files as backed up (violates the safety invariant). The migration must copy the exact tri-state values, including `mtime` in **nanoseconds**, and must not synthesize `copied_at` for legacy rows.
+
+### R3 — `_safe_id` is lossy and can collide; device identity is not recoverable
+
+`_safe_id` (`core/storage.py:69-71`) strips everything except alphanumerics/`-`/`_` and falls back to `"default"`. Distinct device IDs can already map to the same `profile_*`/`state_*` file, and the original ID is not stored anywhere. v2 must:
+
+- import by the filename suffix as an opaque legacy key (or preserve the filename verbatim as a legacy namespace),
+- detect two source files that would collide in a new consolidated schema,
+- avoid merging rows from different devices under one `(device, rel_path)` key,
+- remember that all Wi-Fi rows share `"wifi-backup"` and therefore are **not** attributable to a specific phone (A2.2 concern).
+
+### R4 — Legacy JSON import is silent on failure
+
+`_migrate_legacy_json` ignores `OSError`, `JSONDecodeError`, and non-list JSON (`core/storage.py:187-191`), and coerces every element with `str()` (`:193`). SPEC §6 explicitly forbids silently skipping files when old state cannot be read. v2 must log/report malformed legacy files, count imported vs skipped entries, and surface an actionable migration report — while still never deleting or rewriting the JSON.
+
+### R5 — No schema version means partial migration is undetectable
+
+There is no `user_version`, no ledger, and no completion marker (A3.1/A3.5). A crash mid-migration is indistinguishable from "never migrated". v2 needs a versioned, transactional, idempotent migration with an explicit completion record and a way to detect/repair an interrupted run (SPEC §6: "Detect incomplete migration").
+
+### R6 — Commit batching can under-report copied files
+
+The engine commits every 10th copy (`core/engine.py:475`, `:927`) and `synchronous=NORMAL` can lose the last WAL commits on power loss. Migration must treat the legacy DB as a **lower bound** on what was backed up, not an exact journal. Conversely, because `size IS NULL` rows are trusted, the migration must not "fill in" sizes from the current filesystem — that would silently convert a legacy trusted row into a size/mtime claim v1 never verified.
+
+### R7 — Profiles/settings are unvalidated and whole-file rewrites
+
+`destination` is stored verbatim, enums are only validated on read, `folders` is coerced in the view, and `save_*` replaces the entire file (`core/storage.py:64-66`, `:90-92`). A migration that rewrites these files must preserve unknown keys (settings merge behaviour) and must not lose `folders` on the Wi-Fi profile (v1 never wrote it there, so absence is normal). Paths in `destination` may no longer exist or may point at another user/mount; migrate the string, do not resolve or "fix" it.
+
+### R8 — Concurrency and multi-process access during migration
+
+Wi-Fi opens a new `StateStore` per request (`core/wifi_server.py:687-700`) while the engine holds another; v1 also never coordinates a second SyncUp instance. v2 must acquire an exclusive/consistent view (SQLite backup API gives a consistent snapshot) and must not rename or delete a DB that another process may hold. The v1 corrupt-recovery rename is unsafe under concurrency and must not be reused.
+
+### R9 — Corrupt/partial artifacts in the same directory
+
+The config directory may contain `state_*.db.corrupt-<ns>`, `-wal`/`-shm` sidecars, and `.part-*` temp files. Migration discovery must select only live `state_<safe>.db` / `state_<safe>.json` / `profile_<safe>.json`, ignore temp debris, and treat `.corrupt-*` as evidence for a recovery report — not as current state.
+
+### R10 — No persistent dedup state to migrate
+
+The duplicate finder keeps no DB rows: dedup state is in-memory hashes plus an on-disk `_Duplicates_<epoch>/_manifest.json` in the scan tree (`core/dedup_engine.py`, A2.4.2). There is nothing to import into the new schema for dedup; do not invent a migration. Only `processed` is persistent backup state.
+
+### Open questions / not determinable from source
+
+- **Real-world row counts, `NULL`-row prevalence, and whether any live DB is actually in WAL mode** — cannot be known without reading user data, which is forbidden. All conclusions above are code-derived.
+- **Whether any production user has `state_*.json` without a matching `.db`** — possible by code path, but not observable here.
+- **Original device IDs behind sanitized filenames** — unrecoverable by design.
+- **Windows/macOS path behaviour** — code branches exist but were never validated (A1.4).
