@@ -24,6 +24,8 @@ path = "src/bin/specta_gen.rs"
 tauri-build = { version = "2.7.6", features = [] }
 
 [dependencies]
+# blake2 0.10.6 (2023-10-09)
+blake2 = "0.10.6"
 r2d2 = "0.8.10"
 r2d2_sqlite = "0.37.1"
 rusqlite = { version = "0.42", features = ["bundled", "backup"] }
@@ -33,14 +35,27 @@ specta = { version = "=2.0.0-rc.28", features = ["derive", "function"] }
 specta-typescript = "0.0.15"
 tauri = { version = "2.12.7", features = [] }
 tauri-specta = { version = "=2.0.0-rc.29", features = ["derive", "typescript"] }
+# tempfile 3.27.0 (promoted from dev-dependencies)
+tempfile = "3.27.0"
 thiserror = "2.0.21"
+# tokio 1.54.1 (2026-02-18)
+tokio = { version = "1.54.1", features = ["sync", "time", "rt", "rt-multi-thread", "macros"] }
+# tokio-util 0.7.20 (2026-02-18)
+tokio-util = "0.7.20"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[target.'cfg(unix)'.dependencies]
+# libc 0.2.191 (2026-02-18)
+libc = "0.2.191"
+
+[target.'cfg(windows)'.dependencies]
+# windows-sys 0.59.0 (2024-09-08)
+windows-sys = { version = "0.59.0", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
 
 [dev-dependencies]
-tempfile = "3"
 sha2 = "0.10"
