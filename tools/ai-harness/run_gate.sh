@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -u
 
+MANIFEST=src-tauri/Cargo.toml
+
 run() {
   echo ""
   echo "$ $*"
@@ -9,8 +11,8 @@ run() {
   echo "EXIT=$rc"
 }
 
-run cargo fmt --check
-run cargo check
-run cargo clippy --all-targets -- -D warnings
-run cargo test --no-fail-fast
+run cargo fmt --manifest-path "$MANIFEST" --check
+run cargo check --manifest-path "$MANIFEST"
+run cargo clippy --manifest-path "$MANIFEST" --all-targets -- -D warnings
+run cargo test --manifest-path "$MANIFEST" --no-fail-fast
 run npm run specta:check
