@@ -46,3 +46,11 @@ node_modules/
 dist-web/
 src-tauri/target/
 src-tauri/gen/schemas/
+
+# AI Harness generated artifacts
+.ai-backups/
+.ai-payload.patch
+ai-run-output.txt
+gate-output.txt
+context.md
+reply.json
