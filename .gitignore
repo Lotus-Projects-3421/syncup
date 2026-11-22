@@ -54,3 +54,5 @@ ai-run-output.txt
 gate-output.txt
 context.md
 reply.json
+chatb-context.txt
+context-lean.md
