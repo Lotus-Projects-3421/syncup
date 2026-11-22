@@ -86,6 +86,7 @@ pub fn save_settings(data_dir: &Path, settings: &AppSettings) -> Result<(), Stor
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

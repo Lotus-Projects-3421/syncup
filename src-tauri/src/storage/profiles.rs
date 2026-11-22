@@ -188,6 +188,7 @@ pub fn list_profiles(data_dir: &Path) -> Result<Vec<DeviceProfile>, StorageError
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

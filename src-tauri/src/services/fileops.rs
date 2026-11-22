@@ -904,7 +904,7 @@ mod tests {
             (
                 FileOpError::Io {
                     path: PathBuf::from("/path"),
-                    source: std::io::Error::new(std::io::ErrorKind::Other, "io error"),
+                    source: std::io::Error::other("io error"),
                 },
                 IO_ERROR,
             ),
@@ -925,14 +925,14 @@ mod tests {
             (
                 FileOpError::PublishFailed {
                     path: PathBuf::from("/dest"),
-                    source: std::io::Error::new(std::io::ErrorKind::Other, "publish error"),
+                    source: std::io::Error::other("publish error"),
                 },
                 PUBLISH_FAILED,
             ),
             (
                 FileOpError::PublishPendingDurability {
                     final_path: PathBuf::from("/final"),
-                    source: std::io::Error::new(std::io::ErrorKind::Other, "fsync error"),
+                    source: std::io::Error::other("fsync error"),
                 },
                 PUBLISH_PENDING_DURABILITY,
             ),

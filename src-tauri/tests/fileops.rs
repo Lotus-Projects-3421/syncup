@@ -643,7 +643,7 @@ async fn publish_pending_durability_state_reported() {
             assert_eq!(err_path, final_path);
             let ipc: IpcError = FileOpError::PublishPendingDurability {
                 final_path: err_path,
-                source: std::io::Error::new(std::io::ErrorKind::Other, "simulated fail"),
+                source: std::io::Error::other("simulated fail"),
             }
             .into();
             assert_eq!(ipc.code, "PUBLISH_PENDING_DURABILITY");
