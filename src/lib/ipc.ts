@@ -13,6 +13,9 @@ export const commands = {
 	updateSettings: (settings: AppSettings, options?: InvokeOptions) => __TAURI_INVOKE<null>("update_settings", { settings }, options),
 	listProfiles: (options?: InvokeOptions) => __TAURI_INVOKE<DeviceProfile[]>("list_profiles", undefined, options),
 	saveProfile: (profile: DeviceProfile, options?: InvokeOptions) => __TAURI_INVOKE<null>("save_profile", { profile }, options),
+	listJobs: (options?: InvokeOptions) => __TAURI_INVOKE<Job_Serialize[]>("list_jobs", undefined, options),
+	getJob: (jobId: string, options?: InvokeOptions) => __TAURI_INVOKE<Job_Serialize>("get_job", { jobId }, options),
+	cancelJob: (jobId: string, options?: InvokeOptions) => __TAURI_INVOKE<null>("cancel_job", { jobId }, options),
 };
 
 /* Types */
@@ -46,6 +49,73 @@ export type HealthStatus = {
 export type IpcError = {
 	code: string,
 	message: string,
+};
+
+/**  Public snapshot of a job. */
+export type Job = Job_Serialize | Job_Deserialize;
+
+/**
+ *  Operation family a job belongs to.
+ * 
+ *  Every variant is reserved for a command scheduled in PLAN.md §8; no workflow
+ *  command exists yet in Phase 4c.
+ */
+export type JobKind = 
+/**  `start_backup` — PLAN.md §8 Phase 5 (Linux MTP) and Phase 6 (Wi-Fi). */
+"backup" | 
+/**  `start_wifi_session` — PLAN.md §8 Phase 6. */
+"wifi" | 
+/**  `start_organizer` — PLAN.md §8 Phase 7. */
+"organizer" | 
+/**  `scan_duplicates` / `move_duplicates` / `undo_duplicates` — PLAN.md §8 Phase 8. */
+"dedup" | 
+/**  `run_migration` — PLAN.md §4, scheduled within §8 Phases 5-10. */
+"migration";
+
+/**  Counted progress for a job. */
+export type JobProgress = JobProgress_Serialize | JobProgress_Deserialize;
+
+/**  Counted progress for a job. */
+export type JobProgress_Deserialize = {
+	current: number,
+	total?: number | null,
+	message?: string | null,
+};
+
+/**  Counted progress for a job. */
+export type JobProgress_Serialize = {
+	current: number,
+	total: number | null,
+	message: string | null,
+};
+
+/**  Lifecycle state of a job. */
+export type JobStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
+
+/**  Public snapshot of a job. */
+export type Job_Deserialize = {
+	id: string,
+	kind: JobKind,
+	status: JobStatus,
+	progress: JobProgress_Deserialize,
+	/**  Unix epoch seconds. Bounded below 2^53, so the JSON number is exact. */
+	startedAt: number,
+	/**  Unix epoch seconds; `None` until the job reaches a terminal state. */
+	finishedAt?: number | null,
+	lastError?: string | null,
+};
+
+/**  Public snapshot of a job. */
+export type Job_Serialize = {
+	id: string,
+	kind: JobKind,
+	status: JobStatus,
+	progress: JobProgress_Serialize,
+	/**  Unix epoch seconds. Bounded below 2^53, so the JSON number is exact. */
+	startedAt: number,
+	/**  Unix epoch seconds; `None` until the job reaches a terminal state. */
+	finishedAt: number | null,
+	lastError: string | null,
 };
 
 export type MigrationReport = {

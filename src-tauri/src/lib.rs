@@ -9,6 +9,7 @@ pub mod storage;
 use tauri::Manager;
 use tauri_specta::{collect_commands, Builder};
 
+use crate::services::jobs::JobRegistry;
 use crate::state::AppState;
 
 /// Single source of truth for the typed IPC surface.
@@ -26,7 +27,10 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::migration::get_settings,
         commands::migration::update_settings,
         commands::migration::list_profiles,
-        commands::migration::save_profile
+        commands::migration::save_profile,
+        commands::jobs::list_jobs,
+        commands::jobs::get_job,
+        commands::jobs::cancel_job
     ])
 }
 
@@ -44,9 +48,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let db = storage::open_pool(&data_dir)?;
             tracing::info!("database connection pool ready");
 
+            let jobs = JobRegistry::new(Some(app.handle().clone()));
+
             app.manage(AppState {
                 db,
                 data_dir,
+                jobs,
                 _log_guard: log_guard,
             });
 
