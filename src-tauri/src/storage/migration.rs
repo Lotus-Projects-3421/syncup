@@ -82,14 +82,20 @@ fn extract_device_id_from_path(path: &Path) -> String {
 /// inside the -wal sidecar file outside the main .db file. A plain file copy
 /// would miss uncheckpointed commits, silently losing backup history and
 /// leading to re-copying or state corruption in v2.
-fn create_wal_safe_snapshot(source_path: &Path, target_dir: &Path) -> Result<PathBuf, MigrationError> {
+fn create_wal_safe_snapshot(
+    source_path: &Path,
+    target_dir: &Path,
+) -> Result<PathBuf, MigrationError> {
     std::fs::create_dir_all(target_dir).map_err(MigrationError::Io)?;
 
     let timestamp = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let stem = source_path.file_stem().and_then(|s| s.to_str()).unwrap_or("legacy");
+    let stem = source_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("legacy");
     let snapshot_filename = format!("{stem}_snapshot_{timestamp}.db");
     let snapshot_path = target_dir.join(&snapshot_filename);
 
@@ -166,7 +172,10 @@ fn create_wal_safe_snapshot(source_path: &Path, target_dir: &Path) -> Result<Pat
 }
 
 /// Reads processed rows from a verified legacy snapshot database.
-fn read_rows_from_snapshot(snapshot_path: &Path, device_id: &str) -> Result<Vec<LegacyDbRow>, MigrationError> {
+fn read_rows_from_snapshot(
+    snapshot_path: &Path,
+    device_id: &str,
+) -> Result<Vec<LegacyDbRow>, MigrationError> {
     tracing::info!(
         snapshot = ?snapshot_path,
         device_id = %device_id,
@@ -322,7 +331,9 @@ pub fn migrate_legacy_import(
             if settings_file.exists() {
                 tracing::info!(path = ?settings_file, "[migration] importing legacy settings");
                 if let Ok(content) = std::fs::read_to_string(&settings_file) {
-                    if let Ok(legacy_settings) = serde_json::from_str::<crate::storage::settings::AppSettings>(&content) {
+                    if let Ok(legacy_settings) =
+                        serde_json::from_str::<crate::storage::settings::AppSettings>(&content)
+                    {
                         save_settings(data_dir, &legacy_settings)?;
                         settings_imported = true;
                     }
@@ -334,8 +345,14 @@ pub fn migrate_legacy_import(
                 for entry in entries.flatten() {
                     let path = entry.path();
                     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                    if name.starts_with("profile_") && name.ends_with(".json") && !name.contains(".part-") {
-                        if let Some(safe_id) = name.strip_prefix("profile_").and_then(|s| s.strip_suffix(".json")) {
+                    if name.starts_with("profile_")
+                        && name.ends_with(".json")
+                        && !name.contains(".part-")
+                    {
+                        if let Some(safe_id) = name
+                            .strip_prefix("profile_")
+                            .and_then(|s| s.strip_suffix(".json"))
+                        {
                             if let Ok(Some(profile)) = load_profile(json_dir, safe_id) {
                                 tracing::info!(id = %profile.id, "[migration] importing legacy profile");
                                 save_profile(data_dir, &profile)?;
@@ -351,8 +368,14 @@ pub fn migrate_legacy_import(
                 for entry in entries.flatten() {
                     let path = entry.path();
                     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                    if name.starts_with("state_") && name.ends_with(".json") && !name.contains(".part-") {
-                        if let Some(safe_id) = name.strip_prefix("state_").and_then(|s| s.strip_suffix(".json")) {
+                    if name.starts_with("state_")
+                        && name.ends_with(".json")
+                        && !name.contains(".part-")
+                    {
+                        if let Some(safe_id) = name
+                            .strip_prefix("state_")
+                            .and_then(|s| s.strip_suffix(".json"))
+                        {
                             tracing::info!(id = %safe_id, path = ?path, "[migration] importing legacy state json");
                             if let Ok(content) = std::fs::read_to_string(&path) {
                                 if let Ok(items) = serde_json::from_str::<Vec<String>>(&content) {
@@ -465,7 +488,10 @@ pub fn migrate_legacy_import(
 }
 
 /// Returns the status of data migration in v2 storage.
-pub fn get_migration_status(pool: &DbPool, data_dir: &Path) -> Result<MigrationStatus, StorageError> {
+pub fn get_migration_status(
+    pool: &DbPool,
+    data_dir: &Path,
+) -> Result<MigrationStatus, StorageError> {
     let conn = pool.get().map_err(StorageError::OpenDatabase)?;
 
     let schema_version: i32 = conn

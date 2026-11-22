@@ -58,7 +58,11 @@ pub fn save_settings(data_dir: &Path, settings: &AppSettings) -> Result<(), Stor
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let temp_path = data_dir.join(format!(".settings.json.part-{}-{:x}", std::process::id(), random_suffix));
+    let temp_path = data_dir.join(format!(
+        ".settings.json.part-{}-{:x}",
+        std::process::id(),
+        random_suffix
+    ));
 
     let json_bytes = serde_json::to_vec_pretty(settings).map_err(StorageError::Json)?;
 

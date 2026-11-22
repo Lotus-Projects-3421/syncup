@@ -33,8 +33,7 @@ CREATE TABLE IF NOT EXISTS legacy_import_marker (
 ///
 /// Ensures tables, indexes, and schema version markers exist. Sets `PRAGMA user_version = 2`.
 pub fn init_schema(conn: &Connection) -> Result<(), Error> {
-    let current_version: i32 =
-        conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let current_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
 
     if current_version < SCHEMA_VERSION {
         conn.execute_batch(SCHEMA_V2_DDL)?;

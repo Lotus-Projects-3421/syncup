@@ -42,11 +42,10 @@ pub fn migrate_legacy_import(
 #[tauri::command]
 #[specta::specta]
 pub fn get_migration_status(state: State<'_, AppState>) -> Result<MigrationStatus, IpcError> {
-    crate::storage::migration::get_migration_status(&state.db, &state.data_dir)
-        .map_err(|error| {
-            tracing::error!(error = %error, "failed to get migration status");
-            IpcError::db(&error.to_string())
-        })
+    crate::storage::migration::get_migration_status(&state.db, &state.data_dir).map_err(|error| {
+        tracing::error!(error = %error, "failed to get migration status");
+        IpcError::db(&error.to_string())
+    })
 }
 
 #[tauri::command]

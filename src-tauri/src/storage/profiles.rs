@@ -49,7 +49,10 @@ pub fn sanitize_safe_id(device_id: &str) -> String {
 /// Loads a profile from `<data_dir>/profile_<safe_id>.json`.
 ///
 /// Returns `Ok(None)` if the profile file does not exist or is invalid.
-pub fn load_profile(data_dir: &Path, device_id: &str) -> Result<Option<DeviceProfile>, StorageError> {
+pub fn load_profile(
+    data_dir: &Path,
+    device_id: &str,
+) -> Result<Option<DeviceProfile>, StorageError> {
     let safe_id = sanitize_safe_id(device_id);
     let path = data_dir.join(format!("profile_{safe_id}.json"));
     if !path.exists() {
@@ -66,11 +69,28 @@ pub fn load_profile(data_dir: &Path, device_id: &str) -> Result<Option<DevicePro
 
     match serde_json::from_str::<serde_json::Value>(&content) {
         Ok(val) => {
-            let destination = val.get("destination").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let sorting = val.get("sorting").and_then(|v| v.as_str()).unwrap_or("year").to_string();
-            let filter = val.get("filter").and_then(|v| v.as_str()).unwrap_or("both").to_string();
-            let conflict = val.get("conflict").and_then(|v| v.as_str()).unwrap_or("keep").to_string();
-            let folders = val.get("folders")
+            let destination = val
+                .get("destination")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let sorting = val
+                .get("sorting")
+                .and_then(|v| v.as_str())
+                .unwrap_or("year")
+                .to_string();
+            let filter = val
+                .get("filter")
+                .and_then(|v| v.as_str())
+                .unwrap_or("both")
+                .to_string();
+            let conflict = val
+                .get("conflict")
+                .and_then(|v| v.as_str())
+                .unwrap_or("keep")
+                .to_string();
+            let folders = val
+                .get("folders")
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter()
@@ -108,7 +128,11 @@ pub fn save_profile(data_dir: &Path, profile: &DeviceProfile) -> Result<(), Stor
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let temp_path = data_dir.join(format!(".{filename}.part-{}-{:x}", std::process::id(), random_suffix));
+    let temp_path = data_dir.join(format!(
+        ".{filename}.part-{}-{:x}",
+        std::process::id(),
+        random_suffix
+    ));
 
     let json_bytes = serde_json::to_vec_pretty(profile).map_err(StorageError::Json)?;
 

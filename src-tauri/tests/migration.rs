@@ -126,7 +126,11 @@ fn fresh_import() {
 
     // Verify marker
     let marker_count: i64 = conn
-        .query_row("SELECT count(*) FROM legacy_import_marker WHERE id = 1", [], |r| r.get(0))
+        .query_row(
+            "SELECT count(*) FROM legacy_import_marker WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(marker_count, 1);
 
@@ -143,7 +147,9 @@ fn fresh_import() {
     assert_eq!(settings.theme, "light");
     assert_eq!(settings.window_width, 1400);
 
-    let profile = load_profile(target_dir.path(), "phone-test").unwrap().unwrap();
+    let profile = load_profile(target_dir.path(), "phone-test")
+        .unwrap()
+        .unwrap();
     assert_eq!(profile.destination, "/tmp/legacy_photos");
     assert_eq!(profile.sorting, "month");
 }
@@ -215,7 +221,11 @@ fn interrupted_import_resume() {
         .unwrap();
         // Ensure marker is NOT present
         let marker_count: i64 = conn
-            .query_row("SELECT count(*) FROM legacy_import_marker WHERE id = 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT count(*) FROM legacy_import_marker WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(marker_count, 0);
     }
@@ -240,7 +250,11 @@ fn interrupted_import_resume() {
     assert_eq!(total_rows, 3);
 
     let marker_count: i64 = conn
-        .query_row("SELECT count(*) FROM legacy_import_marker WHERE id = 1", [], |r| r.get(0))
+        .query_row(
+            "SELECT count(*) FROM legacy_import_marker WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(marker_count, 1);
 }
@@ -276,12 +290,7 @@ fn corrupt_snapshot_rejected() {
 
     let pool = open_pool(target_dir.path()).unwrap();
 
-    let result = migrate_legacy_import(
-        &pool,
-        target_dir.path(),
-        Some(&corrupt_db_path),
-        None,
-    );
+    let result = migrate_legacy_import(&pool, target_dir.path(), Some(&corrupt_db_path), None);
 
     assert!(result.is_err());
     match result {
@@ -301,7 +310,9 @@ fn corrupt_snapshot_rejected() {
     assert_eq!(rows, 0);
 
     let markers: i64 = conn
-        .query_row("SELECT count(*) FROM legacy_import_marker", [], |r| r.get(0))
+        .query_row("SELECT count(*) FROM legacy_import_marker", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(markers, 0);
 }
@@ -344,13 +355,7 @@ fn wal_source_handled() {
 
     let pool = open_pool(target_dir.path()).unwrap();
 
-    let report = migrate_legacy_import(
-        &pool,
-        target_dir.path(),
-        Some(&wal_db_path),
-        None,
-    )
-    .unwrap();
+    let report = migrate_legacy_import(&pool, target_dir.path(), Some(&wal_db_path), None).unwrap();
 
     assert!(report.success);
     assert_eq!(report.db_rows_imported, 2);
@@ -388,16 +393,28 @@ fn source_unchanged_after_migration() {
 
     // Record SHA-256 and mtime before migration
     let db_sha_before = compute_file_sha256(&legacy_db_path);
-    let db_mtime_before: SystemTime = std::fs::metadata(&legacy_db_path).unwrap().modified().unwrap();
+    let db_mtime_before: SystemTime = std::fs::metadata(&legacy_db_path)
+        .unwrap()
+        .modified()
+        .unwrap();
 
     let settings_sha_before = compute_file_sha256(&settings_path);
-    let settings_mtime_before: SystemTime = std::fs::metadata(&settings_path).unwrap().modified().unwrap();
+    let settings_mtime_before: SystemTime = std::fs::metadata(&settings_path)
+        .unwrap()
+        .modified()
+        .unwrap();
 
     let profile_sha_before = compute_file_sha256(&profile_path);
-    let profile_mtime_before: SystemTime = std::fs::metadata(&profile_path).unwrap().modified().unwrap();
+    let profile_mtime_before: SystemTime = std::fs::metadata(&profile_path)
+        .unwrap()
+        .modified()
+        .unwrap();
 
     let state_json_sha_before = compute_file_sha256(&state_json_path);
-    let state_json_mtime_before: SystemTime = std::fs::metadata(&state_json_path).unwrap().modified().unwrap();
+    let state_json_mtime_before: SystemTime = std::fs::metadata(&state_json_path)
+        .unwrap()
+        .modified()
+        .unwrap();
 
     // Run migration
     let pool = open_pool(target_dir.path()).unwrap();
@@ -412,27 +429,60 @@ fn source_unchanged_after_migration() {
 
     // Record SHA-256 and mtime after migration
     let db_sha_after = compute_file_sha256(&legacy_db_path);
-    let db_mtime_after: SystemTime = std::fs::metadata(&legacy_db_path).unwrap().modified().unwrap();
+    let db_mtime_after: SystemTime = std::fs::metadata(&legacy_db_path)
+        .unwrap()
+        .modified()
+        .unwrap();
 
     let settings_sha_after = compute_file_sha256(&settings_path);
-    let settings_mtime_after: SystemTime = std::fs::metadata(&settings_path).unwrap().modified().unwrap();
+    let settings_mtime_after: SystemTime = std::fs::metadata(&settings_path)
+        .unwrap()
+        .modified()
+        .unwrap();
 
     let profile_sha_after = compute_file_sha256(&profile_path);
-    let profile_mtime_after: SystemTime = std::fs::metadata(&profile_path).unwrap().modified().unwrap();
+    let profile_mtime_after: SystemTime = std::fs::metadata(&profile_path)
+        .unwrap()
+        .modified()
+        .unwrap();
 
     let state_json_sha_after = compute_file_sha256(&state_json_path);
-    let state_json_mtime_after: SystemTime = std::fs::metadata(&state_json_path).unwrap().modified().unwrap();
+    let state_json_mtime_after: SystemTime = std::fs::metadata(&state_json_path)
+        .unwrap()
+        .modified()
+        .unwrap();
 
     // Assert identical hashes and mtimes
     assert_eq!(db_sha_before, db_sha_after, "DB SHA-256 must match exactly");
-    assert_eq!(db_mtime_before, db_mtime_after, "DB mtime must match exactly");
+    assert_eq!(
+        db_mtime_before, db_mtime_after,
+        "DB mtime must match exactly"
+    );
 
-    assert_eq!(settings_sha_before, settings_sha_after, "settings.json SHA-256 must match exactly");
-    assert_eq!(settings_mtime_before, settings_mtime_after, "settings.json mtime must match exactly");
+    assert_eq!(
+        settings_sha_before, settings_sha_after,
+        "settings.json SHA-256 must match exactly"
+    );
+    assert_eq!(
+        settings_mtime_before, settings_mtime_after,
+        "settings.json mtime must match exactly"
+    );
 
-    assert_eq!(profile_sha_before, profile_sha_after, "profile.json SHA-256 must match exactly");
-    assert_eq!(profile_mtime_before, profile_mtime_after, "profile.json mtime must match exactly");
+    assert_eq!(
+        profile_sha_before, profile_sha_after,
+        "profile.json SHA-256 must match exactly"
+    );
+    assert_eq!(
+        profile_mtime_before, profile_mtime_after,
+        "profile.json mtime must match exactly"
+    );
 
-    assert_eq!(state_json_sha_before, state_json_sha_after, "state.json SHA-256 must match exactly");
-    assert_eq!(state_json_mtime_before, state_json_mtime_after, "state.json mtime must match exactly");
+    assert_eq!(
+        state_json_sha_before, state_json_sha_after,
+        "state.json SHA-256 must match exactly"
+    );
+    assert_eq!(
+        state_json_mtime_before, state_json_mtime_after,
+        "state.json mtime must match exactly"
+    );
 }
