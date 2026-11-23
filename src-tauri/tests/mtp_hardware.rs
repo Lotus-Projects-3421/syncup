@@ -54,19 +54,57 @@ async fn full_backup_hardware() {
     let registry = JobRegistry::new(None);
     let (_job_id, handle, cancel) = registry.register(JobKind::Backup);
 
+    // Test source: ~380 MB Screenshots folder on the Realme GT Neo 2 5G used
+    // for Phase 5 hardware verification. GVFS mounts the phone under an
+    // "Internal shared storage/" prefix, so every phone-internal path must
+    // include that prefix. Deliberately small; edit this if running against
+    // a different device or folder.
+    let source_rel_path = "Internal shared storage/Pictures/Screenshots";
     let config = BackupConfig {
         device_id: device.id.clone(),
-        source_rel_paths: vec!["DCIM".to_string()],
+        source_rel_paths: vec![source_rel_path.to_string()],
         destination_root: dest_root.to_string_lossy().to_string(),
         conflict_mode: ConflictMode::Skip,
         verify_hash: true,
     };
 
+    println!(
+        "BACKUP START device={} source={} dest={}",
+        device.display_name,
+        source_rel_path,
+        dest_root.display()
+    );
+
     let result = run_backup(config, handle, cancel).await;
     println!("BACKUP RESULT IS OK: {}", result.is_ok());
     result.expect("backup failed");
 
-    let dcim_dest = dest_root.join("DCIM");
-    println!("DEST DCIM EXISTS: {}", dcim_dest.exists());
-    let _: &Path = dcim_dest.as_path();
+    let src_dest = dest_root.join(source_rel_path);
+    println!("DEST {} EXISTS: {}", source_rel_path, src_dest.exists());
+    let file_count = walk_file_count(&src_dest);
+    println!("DEST {} FILE COUNT: {}", source_rel_path, file_count);
+    let _: &Path = src_dest.as_path();
+}
+
+fn walk_file_count(root: &Path) -> usize {
+    let mut count = 0usize;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file() {
+                count += 1;
+            }
+        }
+    }
+    count
 }
