@@ -39,9 +39,7 @@ use std::sync::Arc;
 use blake2::{Blake2b512, Digest};
 use tokio_util::sync::CancellationToken;
 
-#[path = "../domain/conflict.rs"]
-pub mod conflict;
-pub use conflict::{format_collision_name, ConflictMode, RunCollisionTracker};
+pub use crate::domain::conflict::{format_collision_name, ConflictMode, RunCollisionTracker};
 
 use crate::ipc::error::{
     IpcError, CANCELLED, DISK_FULL, IO_ERROR, PERMISSION_DENIED, PUBLISH_FAILED,

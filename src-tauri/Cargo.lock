@@ -3514,6 +3514,8 @@ name = "syncup"
 version = "2.0.0"
 dependencies = [
  "blake2",
+ "gio",
+ "glib",
  "libc",
  "r2d2",
  "r2d2_sqlite",

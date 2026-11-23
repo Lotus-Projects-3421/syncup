@@ -56,3 +56,8 @@ context.md
 reply.json
 chatb-context.txt
 context-lean.md
+ai-review-diff.txt
+ai-hotkey.log
+ai-hotkey-notice.txt
+.ai-automation-pending.json
+tools/ai-harness/__pycache__/

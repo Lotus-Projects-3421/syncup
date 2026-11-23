@@ -1,7 +1,9 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod commands;
+pub mod domain;
 pub mod ipc;
+pub mod platform;
 pub mod services;
 pub mod state;
 pub mod storage;
@@ -30,7 +32,10 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::migration::save_profile,
         commands::jobs::list_jobs,
         commands::jobs::get_job,
-        commands::jobs::cancel_job
+        commands::jobs::cancel_job,
+        commands::backup::discover_devices,
+        commands::backup::browse_folders,
+        commands::backup::start_backup
     ])
 }
 

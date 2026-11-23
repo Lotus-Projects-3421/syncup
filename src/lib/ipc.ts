@@ -16,6 +16,9 @@ export const commands = {
 	listJobs: (options?: InvokeOptions) => __TAURI_INVOKE<Job_Serialize[]>("list_jobs", undefined, options),
 	getJob: (jobId: string, options?: InvokeOptions) => __TAURI_INVOKE<Job_Serialize>("get_job", { jobId }, options),
 	cancelJob: (jobId: string, options?: InvokeOptions) => __TAURI_INVOKE<null>("cancel_job", { jobId }, options),
+	discoverDevices: (options?: InvokeOptions) => __TAURI_INVOKE<MtpDevice[]>("discover_devices", undefined, options),
+	browseFolders: (deviceId: DeviceId, options?: InvokeOptions) => __TAURI_INVOKE<FolderNode[]>("browse_folders", { deviceId }, options),
+	startBackup: (config: BackupConfig, options?: InvokeOptions) => __TAURI_INVOKE<string>("start_backup", { config }, options),
 };
 
 /* Types */
@@ -25,6 +28,30 @@ export type AppSettings = {
 	windowHeight: number,
 };
 
+/**  Configuration for a phone backup job. */
+export type BackupConfig = {
+	deviceId: DeviceId,
+	/**  Paths relative to the device mount root to back up. */
+	sourceRelPaths: string[],
+	/**  Absolute destination directory on the local machine. */
+	destinationRoot: string,
+	conflictMode: ConflictMode,
+	/**  Verify content via BLAKE2b hash (true) or size only (false). */
+	verifyHash: boolean,
+};
+
+/**  Strategy to apply when a target destination already exists. */
+export type ConflictMode = 
+/**  Keep existing file and write the new file with a deterministic `name (N).ext` suffix. */
+"keepBoth" | 
+/**  Overwrite the existing file after verifying the new copy. */
+"overwrite" | 
+/**  Skip the operation if the target file already exists. */
+"skip";
+
+/**  Opaque identifier for a discovered MTP device (the GVFS serial portion). */
+export type DeviceId = string;
+
 export type DeviceProfile = {
 	id: string,
 	destination: string,
@@ -32,6 +59,14 @@ export type DeviceProfile = {
 	filter: string,
 	conflict: string,
 	folders: string[],
+};
+
+/**  A folder node in the device tree. */
+export type FolderNode = {
+	name: string,
+	/**  Path relative to the device mount root. */
+	relPath: string,
+	children: FolderNode[],
 };
 
 export type HealthStatus = {
@@ -148,4 +183,12 @@ export type MigrationStatus_Serialize = {
 	profilesCount: number,
 	hasSettings: boolean,
 	importedAt: string | null,
+};
+
+/**  MTP device as discovered via GVFS/GIO. */
+export type MtpDevice = {
+	id: DeviceId,
+	displayName: string,
+	/**  GVFS mount path on the local filesystem (read-only). */
+	mountPath: string,
 };

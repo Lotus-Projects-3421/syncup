@@ -13,6 +13,7 @@ pub const CANCELLED: &str = "CANCELLED";
 pub const VALIDATION_ERROR: &str = "VALIDATION_ERROR";
 pub const VERIFY_FAILED: &str = "VERIFY_FAILED";
 pub const PUBLISH_FAILED: &str = "PUBLISH_FAILED";
+pub const DEVICE_DISCONNECTED: &str = "DEVICE_DISCONNECTED";
 
 /// Structured error returned across the Tauri IPC boundary.
 ///
@@ -85,6 +86,11 @@ impl IpcError {
     }
 
     #[must_use]
+    pub fn device_disconnected(message: &str) -> Self {
+        Self::new(DEVICE_DISCONNECTED, message)
+    }
+
+    #[must_use]
     pub fn unknown() -> Self {
         Self::new(UNKNOWN, "An unexpected error occurred.")
     }
@@ -147,6 +153,10 @@ mod tests {
         assert_eq!(
             IpcError::publish_failed("Publish failed").code,
             PUBLISH_FAILED
+        );
+        assert_eq!(
+            IpcError::device_disconnected("Device disconnected").code,
+            DEVICE_DISCONNECTED
         );
     }
 }

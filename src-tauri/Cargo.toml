@@ -46,6 +46,9 @@ tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+# gio 0.18.4 / glib 0.18.5 pinned to Cargo.lock (Phase 5 MTP discovery via GVFS/GIO).
+gio = "=0.18.4"
+glib = "=0.18.5"
 
 [target.'cfg(unix)'.dependencies]
 # libc 0.2.191 (2026-02-18)
