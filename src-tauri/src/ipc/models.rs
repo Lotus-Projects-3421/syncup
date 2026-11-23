@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 
 use crate::domain::conflict::ConflictMode;
+use crate::services::jobs::JobId;
 
 /// Opaque identifier for a discovered MTP device (the GVFS serial portion).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -41,4 +42,86 @@ pub struct BackupConfig {
     pub conflict_mode: ConflictMode,
     /// Verify content via BLAKE2b hash (true) or size only (false).
     pub verify_hash: bool,
+}
+
+// ---- Phase 6: Wi-Fi backup ----
+
+/// Configuration for a Wi-Fi upload session.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct WifiConfig {
+    /// Absolute local directory used READ-ONLY for manifest diff comparison.
+    pub destination_root: String,
+    /// Explicit opt-in to bind 0.0.0.0 (all interfaces). Defaults to false.
+    #[serde(default)]
+    pub bind_all: bool,
+    /// Session lifetime in seconds; defaults to 1800 when absent.
+    #[serde(default)]
+    #[specta(type = Option<specta_typescript::Number>)]
+    pub ttl_secs: Option<u64>,
+}
+
+/// Returned once by `start_wifi_session`. The token travels over local IPC
+/// only; it must never be placed in a URL, query parameter, or log. Debug is
+/// manually implemented to redact the token.
+#[derive(Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct WifiSessionInfo {
+    pub url: String,
+    pub session_id: String,
+    pub ip: String,
+    pub port: u16,
+    pub token: String,
+    pub job_id: JobId,
+}
+
+impl std::fmt::Debug for WifiSessionInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WifiSessionInfo")
+            .field("url", &self.url)
+            .field("session_id", &self.session_id)
+            .field("ip", &self.ip)
+            .field("port", &self.port)
+            .field("token", &"[REDACTED]")
+            .field("job_id", &self.job_id)
+            .finish()
+    }
+}
+
+/// One client-declared file in a Wi-Fi manifest. Untrusted: re-validated in
+/// Rust; size is enforced against actual streamed bytes by the file engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WifiManifestEntry {
+    pub rel_path: String,
+    pub size: u64,
+    pub mtime_ns: i64,
+}
+
+/// POST /manifest request body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WifiManifestRequest {
+    pub files: Vec<WifiManifestEntry>,
+}
+
+/// POST /manifest response: which files need uploading. Phase 6 diff is
+/// existence + size against the destination root; mtime comparison arrives
+/// with the processed-state DB integration in Phase 9.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WifiManifestResponse {
+    pub missing: Vec<String>,
+    pub changed: Vec<String>,
+    pub unchanged: Vec<String>,
+}
+
+/// POST /upload success response. `hash` is the BLAKE2b-512 hex of the staged
+/// content as verified by the file engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WifiUploadResult {
+    pub rel_path: String,
+    pub bytes_received: u64,
+    pub hash: Option<String>,
 }

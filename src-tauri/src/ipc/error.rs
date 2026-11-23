@@ -14,6 +14,9 @@ pub const VALIDATION_ERROR: &str = "VALIDATION_ERROR";
 pub const VERIFY_FAILED: &str = "VERIFY_FAILED";
 pub const PUBLISH_FAILED: &str = "PUBLISH_FAILED";
 pub const DEVICE_DISCONNECTED: &str = "DEVICE_DISCONNECTED";
+pub const WIFI_AUTH_FAILED: &str = "WIFI_AUTH_FAILED";
+pub const WIFI_RATE_LIMIT: &str = "WIFI_RATE_LIMIT";
+pub const WIFI_SESSION_QUOTA: &str = "WIFI_SESSION_QUOTA";
 
 /// Structured error returned across the Tauri IPC boundary.
 ///
@@ -89,6 +92,18 @@ impl IpcError {
     pub fn device_disconnected(message: &str) -> Self {
         Self::new(DEVICE_DISCONNECTED, message)
     }
+    #[must_use]
+    pub fn wifi_auth_failed(message: &str) -> Self {
+        Self::new(WIFI_AUTH_FAILED, message)
+    }
+    #[must_use]
+    pub fn wifi_rate_limit(message: &str) -> Self {
+        Self::new(WIFI_RATE_LIMIT, message)
+    }
+    #[must_use]
+    pub fn wifi_session_quota(message: &str) -> Self {
+        Self::new(WIFI_SESSION_QUOTA, message)
+    }
 
     #[must_use]
     pub fn unknown() -> Self {
@@ -157,6 +172,12 @@ mod tests {
         assert_eq!(
             IpcError::device_disconnected("Device disconnected").code,
             DEVICE_DISCONNECTED
+        );
+        assert_eq!(IpcError::wifi_auth_failed("auth").code, WIFI_AUTH_FAILED);
+        assert_eq!(IpcError::wifi_rate_limit("rate").code, WIFI_RATE_LIMIT);
+        assert_eq!(
+            IpcError::wifi_session_quota("quota").code,
+            WIFI_SESSION_QUOTA
         );
     }
 }

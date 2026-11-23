@@ -39,9 +39,9 @@ tauri-specta = { version = "=2.0.0-rc.29", features = ["derive", "typescript"] }
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 # tokio 1.54.1 (2026-02-18)
-tokio = { version = "1.54.1", features = ["sync", "time", "rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1.54.1", features = ["sync", "time", "rt", "rt-multi-thread", "macros", "net", "io-util"] }
 # tokio-util 0.7.20 (2026-02-18)
-tokio-util = "0.7.20"
+tokio-util = { version = "0.7.20", features = ["io", "io-util"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
@@ -49,6 +49,13 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # gio 0.18.4 / glib 0.18.5 pinned to Cargo.lock (Phase 5 MTP discovery via GVFS/GIO).
 gio = "=0.18.4"
 glib = "=0.18.5"
+# Phase 6 Wi-Fi server. axum is new; getrandom/subtle/hex/http-body-util pin to
+# versions already present in Cargo.lock (0.3.4 / 2.6.1 / 0.4.3 / 0.1.5).
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+getrandom = "0.3"
+http-body-util = "0.1"
+hex = "0.4"
+subtle = "2"
 
 [target.'cfg(unix)'.dependencies]
 # libc 0.2.191 (2026-02-18)

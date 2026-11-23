@@ -35,7 +35,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::jobs::cancel_job,
         commands::backup::discover_devices,
         commands::backup::browse_folders,
-        commands::backup::start_backup
+        commands::backup::start_backup,
+        commands::wifi::start_wifi_session,
+        commands::wifi::stop_wifi_session
     ])
 }
 
@@ -55,6 +57,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             let jobs = JobRegistry::new(Some(app.handle().clone()));
 
+            app.manage(crate::services::wifi::WifiSessionManager::new());
             app.manage(AppState {
                 db,
                 data_dir,

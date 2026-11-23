@@ -19,6 +19,8 @@ export const commands = {
 	discoverDevices: (options?: InvokeOptions) => __TAURI_INVOKE<MtpDevice[]>("discover_devices", undefined, options),
 	browseFolders: (deviceId: DeviceId, options?: InvokeOptions) => __TAURI_INVOKE<FolderNode[]>("browse_folders", { deviceId }, options),
 	startBackup: (config: BackupConfig, options?: InvokeOptions) => __TAURI_INVOKE<string>("start_backup", { config }, options),
+	startWifiSession: (config: WifiConfig_Deserialize, options?: InvokeOptions) => __TAURI_INVOKE<WifiSessionInfo>("start_wifi_session", { config }, options),
+	stopWifiSession: (options?: InvokeOptions) => __TAURI_INVOKE<null>("stop_wifi_session", undefined, options),
 };
 
 /* Types */
@@ -191,4 +193,41 @@ export type MtpDevice = {
 	displayName: string,
 	/**  GVFS mount path on the local filesystem (read-only). */
 	mountPath: string,
+};
+
+/**  Configuration for a Wi-Fi upload session. */
+export type WifiConfig = WifiConfig_Serialize | WifiConfig_Deserialize;
+
+/**  Configuration for a Wi-Fi upload session. */
+export type WifiConfig_Deserialize = {
+	/**  Absolute local directory used READ-ONLY for manifest diff comparison. */
+	destinationRoot: string,
+	/**  Explicit opt-in to bind 0.0.0.0 (all interfaces). Defaults to false. */
+	bindAll?: boolean,
+	/**  Session lifetime in seconds; defaults to 1800 when absent. */
+	ttlSecs?: number | null,
+};
+
+/**  Configuration for a Wi-Fi upload session. */
+export type WifiConfig_Serialize = {
+	/**  Absolute local directory used READ-ONLY for manifest diff comparison. */
+	destinationRoot: string,
+	/**  Explicit opt-in to bind 0.0.0.0 (all interfaces). Defaults to false. */
+	bindAll: boolean,
+	/**  Session lifetime in seconds; defaults to 1800 when absent. */
+	ttlSecs: number | null,
+};
+
+/**
+ *  Returned once by `start_wifi_session`. The token travels over local IPC
+ *  only; it must never be placed in a URL, query parameter, or log. Debug is
+ *  manually implemented to redact the token.
+ */
+export type WifiSessionInfo = {
+	url: string,
+	sessionId: string,
+	ip: string,
+	port: number,
+	token: string,
+	jobId: string,
 };
