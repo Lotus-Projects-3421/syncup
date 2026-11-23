@@ -61,3 +61,5 @@ ai-hotkey.log
 ai-hotkey-notice.txt
 .ai-automation-pending.json
 tools/ai-harness/__pycache__/
+ai-hotkey-session.log
+chatb-context-full.txt
