@@ -24,6 +24,9 @@ path = "src/bin/specta_gen.rs"
 tauri-build = { version = "2.7.6", features = [] }
 
 [dependencies]
+regex = "1.11"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+chrono = { version = "0.4", features = ["serde"] }
 # blake2 0.10.6 (2023-10-09)
 blake2 = "0.10.6"
 r2d2 = "0.8.10"

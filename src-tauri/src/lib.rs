@@ -37,7 +37,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::backup::browse_folders,
         commands::backup::start_backup,
         commands::wifi::start_wifi_session,
-        commands::wifi::stop_wifi_session
+        commands::wifi::stop_wifi_session,
+        commands::organizer::start_organizer
     ])
 }
 

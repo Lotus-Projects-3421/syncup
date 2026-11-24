@@ -21,6 +21,7 @@ export const commands = {
 	startBackup: (config: BackupConfig, options?: InvokeOptions) => __TAURI_INVOKE<string>("start_backup", { config }, options),
 	startWifiSession: (config: WifiConfig_Deserialize, options?: InvokeOptions) => __TAURI_INVOKE<WifiSessionInfo>("start_wifi_session", { config }, options),
 	stopWifiSession: (options?: InvokeOptions) => __TAURI_INVOKE<null>("stop_wifi_session", undefined, options),
+	startOrganizer: (config: OrganizerConfig, options?: InvokeOptions) => __TAURI_INVOKE<string>("start_organizer", { config }, options),
 };
 
 /* Types */
@@ -194,6 +195,15 @@ export type MtpDevice = {
 	/**  GVFS mount path on the local filesystem (read-only). */
 	mountPath: string,
 };
+
+export type OrganizerConfig = {
+	inputs: string[],
+	destDir: string,
+	conflictMode: ConflictMode,
+	sourceType: SourceType,
+};
+
+export type SourceType = "takeout" | "phoneFolder";
 
 /**  Configuration for a Wi-Fi upload session. */
 export type WifiConfig = WifiConfig_Serialize | WifiConfig_Deserialize;
