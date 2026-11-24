@@ -22,6 +22,10 @@ export const commands = {
 	startWifiSession: (config: WifiConfig_Deserialize, options?: InvokeOptions) => __TAURI_INVOKE<WifiSessionInfo>("start_wifi_session", { config }, options),
 	stopWifiSession: (options?: InvokeOptions) => __TAURI_INVOKE<null>("stop_wifi_session", undefined, options),
 	startOrganizer: (config: OrganizerConfig, options?: InvokeOptions) => __TAURI_INVOKE<string>("start_organizer", { config }, options),
+	scanDuplicates: (config: ScanConfig, options?: InvokeOptions) => __TAURI_INVOKE<string>("scan_duplicates", { config }, options),
+	getScanResults: (jobId: string, options?: InvokeOptions) => __TAURI_INVOKE<DuplicateGroup[]>("get_scan_results", { jobId }, options),
+	moveDuplicates: (scanJobId: string, confirmed: boolean, options?: InvokeOptions) => __TAURI_INVOKE<string>("move_duplicates", { scanJobId, confirmed }, options),
+	undoDuplicates: (manifestId: string, options?: InvokeOptions) => __TAURI_INVOKE<string>("undo_duplicates", { manifestId }, options),
 };
 
 /* Types */
@@ -62,6 +66,19 @@ export type DeviceProfile = {
 	filter: string,
 	conflict: string,
 	folders: string[],
+};
+
+export type DuplicateFile = {
+	path: string,
+	size: number,
+	mtimeNs: number,
+};
+
+export type DuplicateGroup = {
+	size: number,
+	hash: string,
+	keep: DuplicateFile,
+	duplicates: DuplicateFile[],
 };
 
 /**  A folder node in the device tree. */
@@ -201,6 +218,11 @@ export type OrganizerConfig = {
 	destDir: string,
 	conflictMode: ConflictMode,
 	sourceType: SourceType,
+};
+
+export type ScanConfig = {
+	scanRoots: string[],
+	excludePatterns: string[],
 };
 
 export type SourceType = "takeout" | "phoneFolder";

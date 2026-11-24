@@ -406,7 +406,7 @@ fn available_space(_path: &Path) -> std::io::Result<u64> {
 }
 
 #[cfg(unix)]
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
     if SIMULATE_DIR_FSYNC_FAIL.load(Ordering::SeqCst) {
         return Err(std::io::Error::other("Simulated directory fsync failure"));
     }
@@ -422,7 +422,7 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     if SIMULATE_DIR_FSYNC_FAIL.load(Ordering::SeqCst) {
         return Err(std::io::Error::other("Simulated directory fsync failure"));
     }
@@ -432,11 +432,11 @@ fn sync_dir(_dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn compute_file_hash(path: &Path) -> Result<[u8; 64], FileOpError> {
+pub(crate) fn compute_file_hash(path: &Path) -> Result<[u8; 64], FileOpError> {
     let mut file = std::fs::File::open(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::PermissionDenied => FileOpError::PermissionDenied {
             path: path.to_path_buf(),
@@ -803,6 +803,211 @@ pub fn cleanup_orphan_temp_files(dest_root: &Path) -> Result<usize, FileOpError>
         }
     }
     Ok(count)
+}
+
+#[cfg(unix)]
+fn rename_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let src_c = CString::new(src.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let dst_c = CString::new(dst.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let res = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            src_c.as_ptr(),
+            libc::AT_FDCWD,
+            dst_c.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if res == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+    let mut src_w: Vec<u16> = src.as_os_str().encode_wide().collect();
+    src_w.push(0);
+    let mut dst_w: Vec<u16> = dst.as_os_str().encode_wide().collect();
+    dst_w.push(0);
+    let res = unsafe { MoveFileExW(src_w.as_ptr(), dst_w.as_ptr(), 0) };
+    if res != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn rename_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if dst.exists() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "destination exists",
+        ))
+    } else {
+        std::fs::rename(src, dst)
+    }
+}
+
+#[cfg(unix)]
+fn is_cross_device(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(libc::EXDEV)
+}
+#[cfg(windows)]
+fn is_cross_device(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(17)
+}
+#[cfg(not(any(unix, windows)))]
+fn is_cross_device(_err: &std::io::Error) -> bool {
+    false
+}
+
+pub async fn move_verified(
+    source: PathBuf,
+    dest: Destination,
+    expected_hash: [u8; 64],
+    cancel: CancellationToken,
+) -> Result<Published, FileOpError> {
+    let _source_lock = GLOBAL_PATH_LOCKS.lock_for(&source).await;
+    let _dest_lock = GLOBAL_PATH_LOCKS.lock_for(&dest.final_path).await;
+    let source_meta = std::fs::metadata(&source).map_err(|e| match e.kind() {
+        std::io::ErrorKind::PermissionDenied => FileOpError::PermissionDenied {
+            path: source.clone(),
+        },
+        _ => FileOpError::Io {
+            path: source.clone(),
+            source: e,
+        },
+    })?;
+    if !source_meta.is_file() {
+        return Err(FileOpError::Validation {
+            reason: "Source path is not a regular file".into(),
+        });
+    }
+    if dest.final_path.exists() {
+        return Err(FileOpError::Validation {
+            reason: "destination_occupied".into(),
+        });
+    }
+
+    match rename_no_replace(&source, &dest.final_path) {
+        Ok(()) => {
+            sync_dir(dest.final_path.parent().unwrap_or(Path::new("."))).map_err(|e| {
+                FileOpError::PublishPendingDurability {
+                    final_path: dest.final_path.clone(),
+                    source: e,
+                }
+            })?;
+            sync_dir(source.parent().unwrap_or(Path::new("."))).map_err(|e| FileOpError::Io {
+                path: source.clone(),
+                source: e,
+            })?;
+            Ok(Published {
+                final_path: dest.final_path,
+                bytes_written: source_meta.len(),
+                hash: Some(expected_hash),
+            })
+        }
+        Err(e) if is_cross_device(&e) => {
+            let parent_dir = dest.final_path.parent().unwrap_or(Path::new("."));
+            let mut temp_file = tempfile::Builder::new()
+                .prefix(".syncup-move-")
+                .tempfile_in(parent_dir)
+                .map_err(|e| FileOpError::Io {
+                    path: parent_dir.to_path_buf(),
+                    source: e,
+                })?;
+            let mut file = std::fs::File::open(&source).map_err(|e| FileOpError::Io {
+                path: source.clone(),
+                source: e,
+            })?;
+            let mut hasher = Blake2b512::new();
+            let mut buf = [0u8; 64 * 1024];
+            let mut bytes_written = 0u64;
+            loop {
+                if cancel.is_cancelled() {
+                    return Err(FileOpError::Cancelled);
+                }
+                let n = file.read(&mut buf).map_err(|e| FileOpError::Io {
+                    path: source.clone(),
+                    source: e,
+                })?;
+                if n == 0 {
+                    break;
+                }
+                temp_file
+                    .write_all(&buf[..n])
+                    .map_err(|e| FileOpError::Io {
+                        path: temp_file.path().to_path_buf(),
+                        source: e,
+                    })?;
+                hasher.update(&buf[..n]);
+                bytes_written += n as u64;
+            }
+            temp_file.flush().map_err(|e| FileOpError::Io {
+                path: temp_file.path().to_path_buf(),
+                source: e,
+            })?;
+            temp_file
+                .as_file()
+                .sync_all()
+                .map_err(|e| FileOpError::Io {
+                    path: temp_file.path().to_path_buf(),
+                    source: e,
+                })?;
+            let computed_hash: [u8; 64] = hasher.finalize().into();
+            if computed_hash != expected_hash {
+                return Err(FileOpError::HashMismatch {
+                    expected: Box::new(expected_hash),
+                    actual: Box::new(computed_hash),
+                });
+            }
+            if bytes_written != source_meta.len() {
+                return Err(FileOpError::VerifyFailed {
+                    expected_size: source_meta.len(),
+                    actual_size: bytes_written,
+                });
+            }
+            let temp_path = temp_file.path().to_path_buf();
+            rename_no_replace(&temp_path, &dest.final_path).map_err(|e| {
+                FileOpError::PublishFailed {
+                    path: dest.final_path.clone(),
+                    source: e,
+                }
+            })?;
+            let _ = temp_file.keep();
+            std::fs::remove_file(&source).map_err(|e| FileOpError::Io {
+                path: source.clone(),
+                source: e,
+            })?;
+            sync_dir(parent_dir).map_err(|e| FileOpError::PublishPendingDurability {
+                final_path: dest.final_path.clone(),
+                source: e,
+            })?;
+            sync_dir(source.parent().unwrap_or(Path::new("."))).map_err(|e| FileOpError::Io {
+                path: source.clone(),
+                source: e,
+            })?;
+            Ok(Published {
+                final_path: dest.final_path,
+                bytes_written,
+                hash: Some(expected_hash),
+            })
+        }
+        Err(e) => Err(FileOpError::Io {
+            path: source,
+            source: e,
+        }),
+    }
 }
 
 #[cfg(test)]

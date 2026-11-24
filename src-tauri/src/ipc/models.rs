@@ -1,4 +1,4 @@
-//! Phase 5 IPC models for MTP device discovery, folder browsing, and backup.
+//! IPC models for SyncUp v2.
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -124,4 +124,58 @@ pub struct WifiUploadResult {
     pub rel_path: String,
     pub bytes_received: u64,
     pub hash: Option<String>,
+}
+
+// ---- Phase 8: Duplicate Finder ----
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanConfig {
+    pub scan_roots: Vec<String>,
+    pub exclude_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateFile {
+    pub path: String,
+    #[specta(type = specta_typescript::Number)]
+    pub size: u64,
+    #[specta(type = specta_typescript::Number)]
+    pub mtime_ns: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateGroup {
+    #[specta(type = specta_typescript::Number)]
+    pub size: u64,
+    pub hash: String,
+    pub keep: DuplicateFile,
+    pub duplicates: Vec<DuplicateFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum OperationStatus {
+    Pending,
+    Completed,
+    Failed(String),
+    UndoPending,
+    Undone,
+    UndoBlocked(String),
+    Ambiguous,
+    Lost,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestEntry {
+    pub op_id: String,
+    pub source: String,
+    pub dest: String,
+    #[specta(type = specta_typescript::Number)]
+    pub expected_size: u64,
+    pub expected_hash: String,
+    pub status: OperationStatus,
 }

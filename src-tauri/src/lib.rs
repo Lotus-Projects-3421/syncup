@@ -38,7 +38,11 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::backup::start_backup,
         commands::wifi::start_wifi_session,
         commands::wifi::stop_wifi_session,
-        commands::organizer::start_organizer
+        commands::organizer::start_organizer,
+        commands::dedup::scan_duplicates,
+        commands::dedup::get_scan_results,
+        commands::dedup::move_duplicates,
+        commands::dedup::undo_duplicates
     ])
 }
 
@@ -61,10 +65,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             app.manage(crate::services::wifi::WifiSessionManager::new());
             app.manage(AppState {
                 db,
-                data_dir,
+                data_dir: data_dir.clone(),
                 jobs,
+                scan_results: services::dedup::ScanResultStore::default(),
                 _log_guard: log_guard,
             });
+            services::dedup::reconcile_manifests_on_startup(&data_dir)?;
 
             Ok(())
         })

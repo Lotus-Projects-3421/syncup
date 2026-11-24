@@ -1,4 +1,5 @@
 pub mod backup;
+pub mod dedup;
 pub mod fileops;
 pub mod jobs;
 pub mod logging;
