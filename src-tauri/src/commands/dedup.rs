@@ -1,10 +1,10 @@
 use std::fs;
 use std::path::Path;
 
-use crate::ipc::error::IpcError;
+use crate::ipc::error::{IpcError, CANCELLED};
 use crate::ipc::models::{DedupManifestSummary, DuplicateGroup, OperationStatus, ScanConfig};
 use crate::services::dedup::{run_move, run_scan, run_undo, Manifest};
-use crate::services::jobs::JobKind;
+use crate::services::jobs::{JobHandle, JobKind, JobStatus};
 use crate::state::AppState;
 use tauri::State;
 
@@ -19,9 +19,43 @@ pub async fn scan_duplicates(
     let id_str = id.to_string();
     let id_for_task = id_str.clone();
     tokio::spawn(async move {
-        let _ = run_scan(config, id_for_task, &handle, &store, cancel).await;
+        if let Err(error) = run_scan(config, id_for_task, &handle, &store, cancel).await {
+            finish_on_error(&handle, "scan_duplicates", &error);
+        }
     });
     Ok(id_str)
+}
+
+/// Classify a dedup service error into the terminal job status it must produce.
+///
+/// Matches the established cancellation sentinel by exact code equality, as
+/// `services/fileops.rs` does when mapping `FileOpError::Cancelled`. Message
+/// text is never inspected: a validation or I/O failure whose message happens
+/// to mention cancellation is still a failure.
+fn terminal_status_for_error(error: &IpcError) -> JobStatus {
+    if error.code == CANCELLED {
+        JobStatus::Cancelled
+    } else {
+        JobStatus::Failed
+    }
+}
+
+/// Record a dedup task failure and move its job to a terminal state.
+///
+/// The services return `Err` on several early-exit paths without calling
+/// `JobHandle::finish`, so discarding the result would leave the job `Pending`
+/// forever, make cancellation look ineffective, and hide the reason from both
+/// the UI and the log. `JobHandle::finish` ignores a second call once the job is
+/// terminal, so paths that already finished are unaffected.
+fn finish_on_error(handle: &JobHandle, command: &str, error: &IpcError) {
+    let status = terminal_status_for_error(error);
+    tracing::warn!(
+        command = command,
+        code = %error.code,
+        error = %error.message,
+        "dedup task did not complete"
+    );
+    handle.finish(status, Some(error.message.clone()));
 }
 
 #[tauri::command]
@@ -48,7 +82,11 @@ pub async fn move_duplicates(
     let data_dir = state.data_dir.clone();
     let id_str = id.to_string();
     tokio::spawn(async move {
-        let _ = run_move(scan_job_id, confirmed, &handle, &store, &data_dir, cancel).await;
+        if let Err(error) =
+            run_move(scan_job_id, confirmed, &handle, &store, &data_dir, cancel).await
+        {
+            finish_on_error(&handle, "move_duplicates", &error);
+        }
     });
     Ok(id_str)
 }
@@ -63,7 +101,9 @@ pub async fn undo_duplicates(
     let data_dir = state.data_dir.clone();
     let id_str = _id.to_string();
     tokio::spawn(async move {
-        let _ = run_undo(manifest_id, &handle, &data_dir, cancel).await;
+        if let Err(error) = run_undo(manifest_id, &handle, &data_dir, cancel).await {
+            finish_on_error(&handle, "undo_duplicates", &error);
+        }
     });
     Ok(id_str)
 }
@@ -260,6 +300,45 @@ mod tests {
             return Err(format!("expected exactly one summary, got {}", list.len()).into());
         }
         Ok(list.remove(0))
+    }
+
+    #[test]
+    fn cancelled_code_maps_to_cancelled_status() {
+        let error = IpcError::cancelled("Scan cancelled");
+        assert_eq!(terminal_status_for_error(&error), JobStatus::Cancelled);
+    }
+
+    #[test]
+    fn non_cancelled_codes_map_to_failed_status() {
+        for error in [
+            IpcError::validation("No valid scan roots provided"),
+            IpcError::validation("Retained file modified since scan"),
+            IpcError::io("cannot read manifest"),
+            IpcError::verify_failed("hash mismatch"),
+            IpcError::unknown(),
+        ] {
+            assert_eq!(
+                terminal_status_for_error(&error),
+                JobStatus::Failed,
+                "code {} must be a failure",
+                error.code
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_message_text_does_not_imply_cancellation() {
+        // Exact code equality, never substring matching on the message.
+        let error = IpcError::validation("operation was cancelled by the user");
+        assert_eq!(terminal_status_for_error(&error), JobStatus::Failed);
+    }
+
+    #[test]
+    fn cancellation_code_match_is_exact_and_case_sensitive() {
+        let error = IpcError::new("cancelled", "lowercase is a different code");
+        assert_eq!(terminal_status_for_error(&error), JobStatus::Failed);
+        let prefixed = IpcError::new("NOT_CANCELLED", "prefixed is a different code");
+        assert_eq!(terminal_status_for_error(&prefixed), JobStatus::Failed);
     }
 
     #[test]
