@@ -5,7 +5,7 @@ pub static MEDIA_EXTENSIONS: LazyLock<HashSet<String>> = LazyLock::new(|| {
     let exts = [
         "jpg", "jpeg", "png", "gif", "bmp", "tiff", "tif", "webp", "heic", "heif", "avif", "cr2",
         "cr3", "nef", "arw", "dng", "orf", "rw2", "pef", "srw", "raf", "mp4", "mov", "avi", "mkv",
-        "wmv", "flv", "webm", "m4v", "3gp", "mpg", "mpeg", "mts", "m2ts",
+        "wmv", "flv", "webm", "m4v", "3gp", "mpg", "mpeg", "mts", "m2ts", "ts",
     ];
     exts.iter()
         .map(|s| format!(".{}", s.to_lowercase()))

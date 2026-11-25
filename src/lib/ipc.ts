@@ -21,7 +21,7 @@ export const commands = {
 	startBackup: (config: BackupConfig, options?: InvokeOptions) => __TAURI_INVOKE<string>("start_backup", { config }, options),
 	startWifiSession: (config: WifiConfig_Deserialize, options?: InvokeOptions) => __TAURI_INVOKE<WifiSessionInfo>("start_wifi_session", { config }, options),
 	stopWifiSession: (options?: InvokeOptions) => __TAURI_INVOKE<null>("stop_wifi_session", undefined, options),
-	startOrganizer: (config: OrganizerConfig, options?: InvokeOptions) => __TAURI_INVOKE<string>("start_organizer", { config }, options),
+	startOrganizer: (config: OrganizerConfig_Deserialize, options?: InvokeOptions) => __TAURI_INVOKE<string>("start_organizer", { config }, options),
 	scanDuplicates: (config: ScanConfig, options?: InvokeOptions) => __TAURI_INVOKE<string>("scan_duplicates", { config }, options),
 	getScanResults: (jobId: string, options?: InvokeOptions) => __TAURI_INVOKE<DuplicateGroup[]>("get_scan_results", { jobId }, options),
 	moveDuplicates: (scanJobId: string, confirmed: boolean, options?: InvokeOptions) => __TAURI_INVOKE<string>("move_duplicates", { scanJobId, confirmed }, options),
@@ -213,17 +213,31 @@ export type MtpDevice = {
 	mountPath: string,
 };
 
-export type OrganizerConfig = {
+export type OrganizerConfig = OrganizerConfig_Serialize | OrganizerConfig_Deserialize;
+
+export type OrganizerConfig_Deserialize = {
 	inputs: string[],
 	destDir: string,
 	conflictMode: ConflictMode,
 	sourceType: SourceType,
+	sortMode?: SortMode,
+};
+
+export type OrganizerConfig_Serialize = {
+	inputs: string[],
+	destDir: string,
+	conflictMode: ConflictMode,
+	sourceType: SourceType,
+	sortMode: SortMode,
 };
 
 export type ScanConfig = {
 	scanRoots: string[],
 	excludePatterns: string[],
 };
+
+/**  Destination layout, matching the oracle's sort modes. */
+export type SortMode = "year" | "month" | "day" | "flat";
 
 export type SourceType = "takeout" | "phoneFolder";
 
