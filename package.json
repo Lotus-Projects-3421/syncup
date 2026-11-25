@@ -16,13 +16,15 @@
   },
   "dependencies": {
     "@lucide/svelte": "1.77.0",
-    "@tauri-apps/api": "2.12.5"
+    "@tauri-apps/api": "2.12.5",
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "7.3.1",
     "@tailwindcss/vite": "4.3.5",
     "@tauri-apps/cli": "2.12.6",
     "@types/node": "26.6.6",
+    "@types/qrcode": "^1.5.6",
     "cn": "0.5.2",
     "shadcn-svelte": "1.8.1",
     "svelte": "5.59.1",
