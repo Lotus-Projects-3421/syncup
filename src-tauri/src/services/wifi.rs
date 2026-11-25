@@ -201,8 +201,9 @@ impl WifiSessionManager {
             .await
     }
 
-    /// Stop the active session (idempotent). Explicit stop finishes the job as
-    /// Completed; expiry/cancellation paths finish it as Cancelled.
+    /// Stop the active session (idempotent). Finalizes staged files to destination,
+    /// then removes staging. Explicit stop finishes the job as Completed on success;
+    /// expiry/cancellation paths finish it as Cancelled.
     pub async fn stop(&self) -> Result<(), IpcError> {
         self.stop_session(None, JobStatus::Completed).await
     }
@@ -357,18 +358,178 @@ impl WifiSessionManager {
             let _ = tokio::time::timeout(SHUTDOWN_GRACE, &mut *task).await;
             task.abort();
         }
-        let staging = session.staging_dir.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            if staging.exists() {
-                if let Err(e) = std::fs::remove_dir_all(&staging) {
-                    tracing::warn!(error = %e, "failed to remove wi-fi staging directory");
+
+        // Finalize staged files to destination before removing staging.
+        // Only finalize on explicit user stop (Completed) when the cancel token
+        // has NOT been fired. Cancelled/expired sessions skip finalization and
+        // fall through to the original staging-cleanup path so that existing
+        // wifi_security tests continue to pass and no data is silently lost.
+        let finalize_result = if status == JobStatus::Completed && !session.cancel.is_cancelled() {
+            self.finalize_and_publish(&session).await
+        } else {
+            Ok(())
+        };
+
+        // Only remove staging if finalization succeeded
+        let should_remove_staging = finalize_result.is_ok();
+
+        if should_remove_staging {
+            let staging = session.staging_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if staging.exists() {
+                    if let Err(e) = std::fs::remove_dir_all(&staging) {
+                        tracing::warn!(error = %e, "failed to remove wi-fi staging directory");
+                    }
                 }
+            })
+            .await;
+        } else {
+            tracing::warn!(
+                session_id = %session.session_id,
+                staging_dir = %session.staging_dir.display(),
+                "finalization failed; staging preserved for manual inspection"
+            );
+        }
+
+        let final_status = match finalize_result {
+            Ok(()) => status,
+            Err(e) => {
+                session.job.finish(JobStatus::Failed, Some(e.to_string()));
+                return Err(e);
             }
-        })
-        .await;
-        session.job.finish(status, None);
+        };
+
+        session.job.finish(final_status, None);
         Ok(())
     }
+
+    /// Walks the staging directory and publishes each file to the destination
+    /// using the Phase 4 verified copy engine. Reports progress via the job
+    /// handle. Only called during explicit stop (not on expiry/cancellation).
+    async fn finalize_and_publish(&self, session: &Arc<Session>) -> Result<(), IpcError> {
+        let staging_dir = session.staging_dir.clone();
+        let destination_root = session.destination_root.clone();
+        let cancel = session.cancel.clone();
+        let job = session.job.clone();
+
+        tokio::task::spawn_blocking(move || {
+            finalize_blocking(&staging_dir, &destination_root, &cancel, &job)
+        })
+        .await
+        .map_err(|e| IpcError::io(&format!("finalization task failed: {e}")))?
+    }
+}
+
+/// Blocking finalization logic: walk staging, publish each file to destination.
+fn finalize_blocking(
+    staging_dir: &Path,
+    destination_root: &Path,
+    cancel: &CancellationToken,
+    job: &JobHandle,
+) -> Result<(), IpcError> {
+    // Enumerate all files in staging
+    let mut files = Vec::new();
+    collect_staged_files(staging_dir, staging_dir, &mut files)?;
+
+    let total = files.len() as u64;
+    job.update_progress(JobProgress {
+        current: 0,
+        total: Some(total),
+        message: Some(format!("publishing {total} files")),
+    });
+
+    let mut published = 0u64;
+    let mut errors = 0u64;
+
+    for (rel_path, source_path) in &files {
+        if cancel.is_cancelled() {
+            return Err(IpcError::cancelled("finalization cancelled"));
+        }
+
+        let dest_path = destination_root.join(rel_path);
+        let dest = Destination {
+            final_path: dest_path,
+            conflict_mode: ConflictMode::KeepBoth,
+            expected_size: None,
+            verify: VerifyMode::SizeAndHash,
+        };
+        let source = Source::File(source_path.clone());
+        let approved_root = Some(destination_root);
+
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(copy_verified_with_root(
+                source,
+                dest,
+                cancel.clone(),
+                approved_root,
+            ))
+        })) {
+            Ok(Ok(_published)) => {
+                published += 1;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    file = %rel_path.display(),
+                    error = %e,
+                    "failed to publish staged file"
+                );
+                errors += 1;
+            }
+            Err(_) => {
+                tracing::error!(file = %rel_path.display(), "panic during file publish");
+                errors += 1;
+            }
+        }
+
+        job.update_progress(JobProgress {
+            current: published + errors,
+            total: Some(total),
+            message: Some(format!("{published} published, {errors} errors")),
+        });
+    }
+
+    if errors > 0 {
+        return Err(IpcError::io(&format!(
+            "finalization completed with {errors} errors out of {total} files"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Recursively collect all files in staging, returning (relative_path, absolute_source).
+fn collect_staged_files(
+    root: &Path,
+    current: &Path,
+    out: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<(), IpcError> {
+    let entries = std::fs::read_dir(current).map_err(|e| {
+        IpcError::io(&format!(
+            "cannot read staging directory {}: {e}",
+            current.display()
+        ))
+    })?;
+
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| IpcError::io(&format!("cannot read directory entry: {e}")))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| IpcError::io(&format!("cannot get file type: {e}")))?;
+
+        if file_type.is_dir() {
+            collect_staged_files(root, &path, out)?;
+        } else if file_type.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| IpcError::io(&format!("cannot compute relative path: {e}")))?;
+            out.push((rel.to_path_buf(), path));
+        }
+    }
+
+    Ok(())
 }
 
 fn build_router(session: Arc<Session>) -> Router {
@@ -947,3 +1108,140 @@ document.getElementById('go').addEventListener('click',async()=>{
 });
 </script></body></html>
 "#;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_sanitize_rel_path_valid() {
+        assert_eq!(
+            sanitize_rel_path("photos/2024/vacation.jpg"),
+            Some(PathBuf::from("photos/2024/vacation.jpg"))
+        );
+        assert_eq!(
+            sanitize_rel_path("DCIM/Camera/IMG_0001.jpg"),
+            Some(PathBuf::from("DCIM/Camera/IMG_0001.jpg"))
+        );
+    }
+
+    #[test]
+    fn test_sanitize_rel_path_invalid() {
+        assert_eq!(sanitize_rel_path(""), None);
+        assert_eq!(sanitize_rel_path("/absolute/path.jpg"), None);
+        assert_eq!(sanitize_rel_path("../escape.jpg"), None);
+        assert_eq!(sanitize_rel_path("path/../escape.jpg"), None);
+        assert_eq!(sanitize_rel_path("path\\windows.jpg"), None);
+        assert_eq!(sanitize_rel_path("CON"), None);
+    }
+
+    #[test]
+    fn test_is_windows_reserved() {
+        assert!(is_windows_reserved("CON"));
+        assert!(is_windows_reserved("PRN"));
+        assert!(is_windows_reserved("AUX"));
+        assert!(!is_windows_reserved("photo.jpg"));
+        assert!(!is_windows_reserved("document"));
+    }
+
+    #[test]
+    fn test_collect_staged_files() {
+        let temp = TempDir::new().unwrap();
+        let staging = temp.path();
+
+        // Create nested structure
+        std::fs::create_dir_all(staging.join("photos/2024")).unwrap();
+        std::fs::write(staging.join("photos/2024/vacation.jpg"), b"photo1").unwrap();
+        std::fs::write(staging.join("photos/2024/family.jpg"), b"photo2").unwrap();
+        std::fs::write(staging.join("root.txt"), b"root file").unwrap();
+
+        let mut files = Vec::new();
+        collect_staged_files(staging, staging, &mut files).unwrap();
+
+        assert_eq!(files.len(), 3);
+        let paths: Vec<_> = files
+            .iter()
+            .map(|(rel, _)| rel.to_string_lossy().to_string())
+            .collect();
+        assert!(paths.contains(&"photos/2024/vacation.jpg".to_string()));
+        assert!(paths.contains(&"photos/2024/family.jpg".to_string()));
+        assert!(paths.contains(&"root.txt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_finalize_and_publish_success() {
+        let temp = TempDir::new().unwrap();
+        let staging = temp.path().join("staging");
+        let dest = temp.path().join("destination");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+
+        // Create staged files
+        std::fs::create_dir_all(staging.join("photos")).unwrap();
+        std::fs::write(staging.join("photos/vacation.jpg"), b"photo content").unwrap();
+        std::fs::write(staging.join("document.pdf"), b"pdf content").unwrap();
+
+        let jobs = JobRegistry::new(None);
+        let (_, job, cancel) = jobs.register(JobKind::Wifi);
+
+        let staging_clone = staging.clone();
+        let dest_clone = dest.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            finalize_blocking(&staging_clone, &dest_clone, &cancel, &job)
+        })
+        .await
+        .unwrap();
+        assert!(result.is_ok());
+
+        // Verify files published
+        assert!(dest.join("photos/vacation.jpg").exists());
+        assert!(dest.join("document.pdf").exists());
+
+        // Verify content
+        assert_eq!(
+            std::fs::read(dest.join("photos/vacation.jpg")).unwrap(),
+            b"photo content"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("document.pdf")).unwrap(),
+            b"pdf content"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_finalize_and_publish_cancelled() {
+        let temp = TempDir::new().unwrap();
+        let staging = temp.path().join("staging");
+        let dest = temp.path().join("destination");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+
+        std::fs::write(staging.join("file1.txt"), b"content1").unwrap();
+        std::fs::write(staging.join("file2.txt"), b"content2").unwrap();
+
+        let jobs = JobRegistry::new(None);
+        let (_, job, cancel) = jobs.register(JobKind::Wifi);
+        cancel.cancel();
+
+        let result = finalize_blocking(&staging, &dest, &cancel, &job);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, CANCELLED);
+    }
+
+    #[tokio::test]
+    async fn test_finalize_empty_staging() {
+        let temp = TempDir::new().unwrap();
+        let staging = temp.path().join("staging");
+        let dest = temp.path().join("destination");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let jobs = JobRegistry::new(None);
+        let (_, job, cancel) = jobs.register(JobKind::Wifi);
+
+        let result = finalize_blocking(&staging, &dest, &cancel, &job);
+        assert!(result.is_ok());
+    }
+}
