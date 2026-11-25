@@ -4,8 +4,13 @@
   import { Badge } from "$lib/components/ui/badge";
   import { Button } from "$lib/components/ui/button";
   import { Card } from "$lib/components/ui/card";
-  import type { DuplicateGroup, Job_Serialize } from "$lib/ipc";
-  import { fetchScanResults, startScan } from "$lib/services/dedup";
+  import type { DedupManifestSummary, DuplicateGroup, Job_Serialize } from "$lib/ipc";
+  import {
+    fetchManifests,
+    fetchScanResults,
+    startMove,
+    startScan,
+  } from "$lib/services/dedup";
   import type { AppError } from "$lib/services/errors";
   import { cancelJob, fetchJob, fetchJobs } from "$lib/services/jobs";
 
@@ -36,6 +41,23 @@
   let resultsLoading = $state(false);
   let resultsError = $state<AppError | null>(null);
   let visibleCount = $state(PAGE_SIZE);
+
+  // The scan whose preview is currently displayed. Kept separately from jobId
+  // because jobId follows whichever dedup job is active, including a move.
+  let scanJobId = $state<string | null>(null);
+  let previewConsumed = $state(false);
+  let moveConfirmed = $state(false);
+  let moveStarting = $state(false);
+  let moveError = $state<AppError | null>(null);
+  let moveJobId = $state<string | null>(null);
+  let moveAttempted = $state(false);
+
+  // Manifest attribution. The backend never returns the manifest id, so it is
+  // discovered by comparing the manifest list before and after the move.
+  let baselineIds = $state<string[] | null>(null);
+  let moveManifest = $state<DedupManifestSummary | null>(null);
+  let manifestNotice = $state<string | null>(null);
+  let manifestLoading = $state(false);
 
   let pollTimer: number | undefined;
   let pollInFlight = false;
@@ -102,6 +124,7 @@
   let isCompleted = $derived(job !== null && job.status === "completed");
   let isCancelled = $derived(job !== null && job.status === "cancelled");
   let isFailed = $derived(job !== null && job.status === "failed");
+  let isTerminal = $derived(isCompleted || isCancelled || isFailed);
 
   let totalGroups = $derived(groups.length);
   let totalDuplicates = $derived(
@@ -113,6 +136,39 @@
   let visibleGroups = $derived(groups.slice(0, visibleCount));
   let hasMore = $derived(visibleCount < totalGroups);
   let noDuplicates = $derived(isCompleted && resultsLoaded && totalGroups === 0);
+
+  // A move may only be started from a live, unconsumed preview belonging to a
+  // completed scan, with an explicit tick and no dedup job already running.
+  let canMove = $derived(
+    !moveStarting &&
+      !moveAttempted &&
+      !previewConsumed &&
+      resultsLoaded &&
+      totalGroups > 0 &&
+      scanJobId !== null &&
+      moveConfirmed &&
+      (job === null || isTerminal),
+  );
+
+  let showMoveProgress = $derived(moveJobId !== null && jobId === moveJobId);
+
+  let manifestTotal = $derived(moveManifest === null ? 0 : moveManifest.totalOps);
+  let manifestMoved = $derived(moveManifest === null ? 0 : moveManifest.completedOps);
+  let manifestFailed = $derived(moveManifest === null ? 0 : moveManifest.failedOps);
+  let manifestBlocked = $derived(moveManifest === null ? 0 : moveManifest.blockedOps);
+  let manifestPending = $derived(moveManifest === null ? 0 : moveManifest.pendingOps);
+  let manifestUndone = $derived(moveManifest === null ? 0 : moveManifest.undoneOps);
+  let manifestAttention = $derived(moveManifest === null ? 0 : moveManifest.attentionOps);
+  let manifestPartial = $derived(
+    moveManifest !== null &&
+      (manifestFailed > 0 ||
+        manifestBlocked > 0 ||
+        manifestPending > 0 ||
+        manifestAttention > 0),
+  );
+  let manifestAllMoved = $derived(
+    moveManifest !== null && manifestTotal > 0 && manifestMoved === manifestTotal,
+  );
 
   function stopPolling(): void {
     if (pollTimer !== undefined) {
@@ -136,6 +192,56 @@
     resultsLoaded = false;
     resultsError = null;
     visibleCount = PAGE_SIZE;
+  }
+
+  /**
+   * Attribute a finished move to a manifest by set difference.
+   *
+   * Exactly one new id is attributable. Zero means no manifest was created, so
+   * nothing was recorded as moved. More than one cannot be resolved with the
+   * current API, because another process may have created a manifest concurrently
+   * and the listing exposes no job linkage. In that case nothing is selected.
+   */
+  async function resolveMoveManifest(): Promise<void> {
+    manifestLoading = true;
+    manifestNotice = null;
+    moveManifest = null;
+    const before = baselineIds;
+    const result = await fetchManifests();
+    if (destroyed) {
+      return;
+    }
+    manifestLoading = false;
+    if (!result.ok) {
+      manifestNotice =
+        "The manifest list could not be read, so this move cannot be attributed to a record. " +
+        "Files may still have been moved. Check the application log before scanning again.";
+      return;
+    }
+    if (before === null) {
+      manifestNotice =
+        "No pre-move manifest snapshot was captured, so this move cannot be attributed to a record.";
+      return;
+    }
+    const known = new Set(before);
+    const created = result.value.filter((item) => !known.has(item.manifestId));
+    if (created.length === 1) {
+      const onlyCreated = created[0];
+      if (onlyCreated !== undefined) {
+        moveManifest = onlyCreated;
+        return;
+      }
+    }
+    if (created.length === 0) {
+      manifestNotice =
+        "No new manifest was created. The move stopped before recording any operation, " +
+        "so no file is recorded as moved.";
+      return;
+    }
+    manifestNotice =
+      created.length +
+      " new manifests appeared during this move, so the result cannot be attributed to one record. " +
+      "SyncUp will not guess. Check the application log to see which files were moved.";
   }
 
   async function loadResults(id: string): Promise<void> {
@@ -171,7 +277,14 @@
     if (result.ok) {
       job = result.value;
       jobError = null;
-      if (result.value.status === "completed") {
+      if (id === moveJobId) {
+        // A move never produces a preview. Its outcome must come from the
+        // manifest, because the job reports Completed even when operations fail.
+        if (result.value.status !== "pending" && result.value.status !== "running") {
+          stopPolling();
+          await resolveMoveManifest();
+        }
+      } else if (result.value.status === "completed") {
         stopPolling();
         await loadResults(id);
       } else if (result.value.status === "cancelled" || result.value.status === "failed") {
@@ -212,6 +325,10 @@
         job = active;
         attached = true;
         clearResults();
+        // The operation kind is not exposed and no baseline exists for a job
+        // started elsewhere, so no move result can be claimed for it.
+        moveJobId = null;
+        baselineIds = null;
         startPolling();
       }
     } else {
@@ -238,8 +355,17 @@
     }
     if (result.ok) {
       jobId = result.value;
+      scanJobId = result.value;
       job = null;
       attached = false;
+      previewConsumed = false;
+      moveConfirmed = false;
+      moveAttempted = false;
+      moveJobId = null;
+      moveError = null;
+      moveManifest = null;
+      manifestNotice = null;
+      baselineIds = null;
       const first = await fetchJob(result.value);
       if (!destroyed && first.ok) {
         job = first.value;
@@ -249,6 +375,64 @@
       startError = result.error;
     }
     starting = false;
+  }
+
+  /**
+   * Move every previewed duplicate to quarantine.
+   *
+   * The manifest list is snapshotted first: without that baseline the created
+   * manifest could not be identified afterwards, so the move is refused rather
+   * than started blind. Once attempted, the preview is invalidated regardless of
+   * outcome, because a partially processed session no longer describes reality.
+   */
+  async function handleMove(): Promise<void> {
+    const id = scanJobId;
+    if (!canMove || id === null) {
+      return;
+    }
+    moveStarting = true;
+    moveError = null;
+    manifestNotice = null;
+    moveManifest = null;
+
+    const baseline = await fetchManifests();
+    if (destroyed) {
+      moveStarting = false;
+      return;
+    }
+    if (!baseline.ok) {
+      moveError = baseline.error;
+      moveStarting = false;
+      return;
+    }
+    baselineIds = baseline.value.map((item) => item.manifestId);
+
+    // Invalidate the preview before the call, so no second move can be issued
+    // against this session even if the request or the job fails.
+    moveAttempted = true;
+    previewConsumed = true;
+
+    const result = await startMove(id, true);
+    if (destroyed) {
+      moveStarting = false;
+      return;
+    }
+    if (result.ok) {
+      moveJobId = result.value;
+      jobId = result.value;
+      job = null;
+      attached = false;
+      jobError = null;
+      cancelError = null;
+      const first = await fetchJob(result.value);
+      if (!destroyed && first.ok) {
+        job = first.value;
+      }
+      startPolling();
+    } else {
+      moveError = result.error;
+    }
+    moveStarting = false;
   }
 
   async function handleCancel(): Promise<void> {
@@ -279,6 +463,17 @@
     jobError = null;
     startError = null;
     cancelError = null;
+    scanJobId = null;
+    previewConsumed = false;
+    moveConfirmed = false;
+    moveStarting = false;
+    moveError = null;
+    moveJobId = null;
+    moveAttempted = false;
+    baselineIds = null;
+    moveManifest = null;
+    manifestNotice = null;
+    manifestLoading = false;
     clearResults();
   }
 
@@ -406,7 +601,9 @@
     <Card>
       <div class="flex flex-wrap items-start justify-between gap-3">
         <div class="min-w-0">
-          <h2 class="text-base font-semibold">Duplicate scan</h2>
+          <h2 class="text-base font-semibold">
+            {showMoveProgress ? "Duplicate move" : "Duplicate scan"}
+          </h2>
           <p class="mt-1 break-all text-xs text-muted-foreground">Job {jobId}</p>
         </div>
         {#if isCompleted}
@@ -421,7 +618,7 @@
           <Badge class="bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200">Failed</Badge>
         {:else}
           <Badge class="bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200">
-            Scanning
+            {showMoveProgress ? "Moving" : "Scanning"}
           </Badge>
         {/if}
       </div>
@@ -445,17 +642,27 @@
             <RefreshCw class="size-4 animate-spin" aria-hidden="true" />
             {#if job?.progress.message}
               <span class="min-w-0 truncate">{job.progress.message}</span>
+            {:else if showMoveProgress}
+              <span>Preparing the move record…</span>
             {:else}
               <span>Scanning files. This can take a while on large folders.</span>
             {/if}
           </div>
-          <p class="mt-2 text-xs text-muted-foreground">
-            The backend does not report how many files a scan has examined, so no percentage or
-            file count is shown. The result appears when the scan finishes.
-          </p>
-          {#if job?.progress.total !== null && job?.progress.total !== undefined}
-            <p class="mt-1 text-xs text-muted-foreground">
-              {job.progress.current} of {job.progress.total} operations reported.
+          {#if showMoveProgress}
+            <p class="mt-2 text-xs text-muted-foreground">
+              Each file is re-hashed and moved only after verification. An occupied destination
+              is never overwritten.
+            </p>
+            {#if job?.progress.total !== null && job?.progress.total !== undefined}
+              <p class="mt-1 text-xs text-muted-foreground">
+                {job.progress.current} of {job.progress.total} operations started. The final
+                counts come from the move record, not this counter.
+              </p>
+            {/if}
+          {:else}
+            <p class="mt-2 text-xs text-muted-foreground">
+              The backend does not report how many files a scan has examined, so no percentage or
+              file count is shown. The result appears when the scan finishes.
             </p>
           {/if}
           <div class="mt-4 flex flex-wrap items-center gap-3">
@@ -470,7 +677,7 @@
         </div>
       {/if}
 
-      {#if isCancelled}
+      {#if isCancelled && !showMoveProgress}
         <div class="mt-4 space-y-3">
           <p class="text-sm text-muted-foreground" role="status">
             Job cancelled. No preview is shown for a cancelled run, and nothing was moved.
@@ -481,7 +688,7 @@
         </div>
       {/if}
 
-      {#if isFailed}
+      {#if isFailed && !showMoveProgress}
         <div class="mt-4 space-y-3">
           <div class="rounded-md border border-destructive/40 bg-destructive/10 p-3">
             {#if job?.lastError}
@@ -502,7 +709,114 @@
         </div>
       {/if}
 
-      {#if isCompleted}
+      {#if showMoveProgress && isTerminal}
+        <div class="mt-4 space-y-3">
+          {#if isFailed && job?.lastError}
+            <p class="text-sm text-destructive" role="alert">{job.lastError}</p>
+          {/if}
+          {#if isCancelled}
+            <p class="text-sm text-muted-foreground" role="status">
+              Move cancelled at a file boundary. Files already moved stay in quarantine.
+            </p>
+          {/if}
+
+          {#if manifestLoading}
+            <p class="flex items-center gap-2 text-sm text-muted-foreground" role="status">
+              <RefreshCw class="size-4 animate-spin" aria-hidden="true" />
+              Reading the move record…
+            </p>
+          {:else if moveManifest !== null}
+            <dl class="grid gap-2 text-sm sm:grid-cols-3">
+              <div>
+                <dt class="text-muted-foreground">Moved to quarantine</dt>
+                <dd class="font-medium">{manifestMoved}</dd>
+              </div>
+              <div>
+                <dt class="text-muted-foreground">Not moved</dt>
+                <dd class="font-medium">{manifestFailed}</dd>
+              </div>
+              <div>
+                <dt class="text-muted-foreground">Recorded operations</dt>
+                <dd class="font-medium">{manifestTotal}</dd>
+              </div>
+              {#if manifestBlocked > 0}
+                <div>
+                  <dt class="text-muted-foreground">Blocked</dt>
+                  <dd class="font-medium">{manifestBlocked}</dd>
+                </div>
+              {/if}
+              {#if manifestPending > 0}
+                <div>
+                  <dt class="text-muted-foreground">Unresolved</dt>
+                  <dd class="font-medium">{manifestPending}</dd>
+                </div>
+              {/if}
+              {#if manifestUndone > 0}
+                <div>
+                  <dt class="text-muted-foreground">Already restored</dt>
+                  <dd class="font-medium">{manifestUndone}</dd>
+                </div>
+              {/if}
+            </dl>
+
+            {#if manifestAttention > 0}
+              <div class="rounded-md border border-destructive/40 bg-destructive/10 p-3">
+                <p class="text-sm text-destructive" role="alert">
+                  {manifestAttention} operation{manifestAttention === 1 ? "" : "s"} need review.
+                </p>
+                <p class="mt-1 text-xs text-muted-foreground">
+                  The record marks these as ambiguous or lost, meaning the file could not be
+                  accounted for at either path. Inspect the folders and the application log
+                  before doing anything else.
+                </p>
+              </div>
+            {/if}
+
+            {#if manifestAllMoved}
+              <p class="flex items-center gap-2 text-sm text-muted-foreground" role="status">
+                <ShieldCheck class="size-4" aria-hidden="true" />
+                Every recorded copy was verified and moved to quarantine. Nothing was deleted.
+              </p>
+            {:else if manifestPartial}
+              <div class="rounded-md border border-destructive/40 bg-destructive/10 p-3">
+                <p class="text-sm text-destructive" role="alert">
+                  Partial result: {manifestMoved} of {manifestTotal} recorded copies were moved.
+                </p>
+                <p class="mt-1 text-xs text-muted-foreground">
+                  The job can report completion even when individual files fail. The counts above
+                  come from the move record. Files that were not moved remain where they were.
+                </p>
+              </div>
+            {:else if manifestTotal === 0}
+              <p class="text-sm text-muted-foreground" role="status">
+                The record contains no operations, so nothing was moved.
+              </p>
+            {/if}
+
+            <p class="break-all text-xs text-muted-foreground">
+              Move record {moveManifest.manifestId}
+            </p>
+          {:else if manifestNotice !== null}
+            <div class="rounded-md border border-destructive/40 bg-destructive/10 p-3">
+              <p class="text-sm text-destructive" role="alert">{manifestNotice}</p>
+            </div>
+          {/if}
+
+          <div class="rounded-md border bg-muted/40 p-3 text-xs text-muted-foreground">
+            <p>
+              This preview can no longer be used for another move, even if the move failed or was
+              cancelled. Scan again to see the current state of these folders.
+            </p>
+            <p class="mt-1">Restoring quarantined files is not available on this screen yet.</p>
+          </div>
+
+          <div>
+            <Button variant="outline" onclick={resetScan}>Start a fresh scan</Button>
+          </div>
+        </div>
+      {/if}
+
+      {#if isCompleted && !showMoveProgress}
         <div class="mt-4 space-y-3">
           {#if resultsLoading}
             <p class="flex items-center gap-2 text-sm text-muted-foreground" role="status">
@@ -571,9 +885,21 @@
           {cancelError.code}: {cancelError.message}
         </p>
       {/if}
+
+      {#if moveError !== null}
+        <div class="mt-4 rounded-md border border-destructive/40 bg-destructive/10 p-3">
+          <p class="text-sm text-destructive" role="alert">
+            {moveError.code}: {moveError.message}
+          </p>
+          <p class="mt-1 text-xs text-muted-foreground">
+            The move was not started, or could not be confirmed as started. Nothing has been
+            retried automatically. Scan again before attempting another move.
+          </p>
+        </div>
+      {/if}
     </Card>
 
-    {#if resultsLoaded && totalGroups > 0}
+    {#if resultsLoaded && totalGroups > 0 && !previewConsumed}
       <Card>
         <h2 class="text-base font-semibold">Preview</h2>
         <div class="mt-2 rounded-md border bg-muted/40 p-3 text-xs text-muted-foreground">
@@ -586,8 +912,43 @@
             every group shown here. To narrow the set, scan fewer folders or add exclusions.
           </p>
           <p class="mt-1">
-            Nothing has been moved yet. Moving and undoing are not available on this screen yet.
+            Quarantine is a separate holding folder, not deletion. Restoring quarantined files is
+            not available on this screen yet.
           </p>
+        </div>
+
+        <div class="mt-4 rounded-md border border-destructive/40 bg-destructive/10 p-3">
+          <p class="text-sm font-medium text-destructive">
+            Move all {totalDuplicates} cop{totalDuplicates === 1 ? "y" : "ies"} to quarantine
+          </p>
+          <p class="mt-1 text-xs text-muted-foreground">
+            Every group listed above is processed. Each retained file is re-hashed first, and the
+            whole move is refused if a retained file changed since the scan. Sources are re-hashed
+            before moving, and an occupied destination is never overwritten.
+          </p>
+          <label class="mt-2 flex items-start gap-2 text-sm">
+            <input
+              type="checkbox"
+              class="mt-1"
+              bind:checked={moveConfirmed}
+              disabled={moveStarting || moveAttempted}
+            />
+            <span>
+              I understand that all {totalDuplicates} previewed cop{totalDuplicates === 1 ? "y" : "ies"} will
+              be moved out of these folders, and that I will need a fresh scan afterwards.
+            </span>
+          </label>
+          <div class="mt-3 flex flex-wrap items-center gap-3">
+            <Button variant="destructive" onclick={handleMove} disabled={!canMove}>
+              {moveStarting ? "Starting move…" : "Move duplicates to quarantine"}
+            </Button>
+            {#if moveStarting}
+              <span class="flex items-center gap-2 text-sm text-muted-foreground" role="status">
+                <RefreshCw class="size-4 animate-spin" aria-hidden="true" />
+                Recording the move…
+              </span>
+            {/if}
+          </div>
         </div>
 
         <p class="mt-3 text-xs text-muted-foreground">
@@ -640,6 +1001,20 @@
             <Button variant="outline" onclick={showMore}>Show more groups</Button>
           </div>
         {/if}
+      </Card>
+    {/if}
+
+    {#if previewConsumed && !showMoveProgress}
+      <Card>
+        <h2 class="text-base font-semibold">Preview no longer valid</h2>
+        <p class="mt-2 text-sm text-muted-foreground">
+          A move was attempted from this preview, so it can no longer be used as the basis for
+          another move. Some files may already have been moved. Scan again to see the current
+          state of these folders.
+        </p>
+        <div class="mt-3">
+          <Button variant="outline" onclick={resetScan}>Start a fresh scan</Button>
+        </div>
       </Card>
     {/if}
   {/if}
