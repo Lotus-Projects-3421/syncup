@@ -7,6 +7,15 @@ import type { InvokeOptions } from "@tauri-apps/api/core";
 export const commands = {
 	appVersion: (options?: InvokeOptions) => __TAURI_INVOKE<string>("app_version", undefined, options),
 	healthCheck: (options?: InvokeOptions) => __TAURI_INVOKE<HealthStatus>("health_check", undefined, options),
+	/**
+	 *  Runs the legacy import off the calling thread.
+	 * 
+	 *  A synchronous `#[tauri::command]` executes on the main thread, while this
+	 *  import performs blocking SQLite backup, integrity-check, filesystem and
+	 *  transaction work whose duration scales with the legacy database size. The
+	 *  blocking work is therefore moved into `spawn_blocking`, matching the pattern
+	 *  already used by `commands::backup`.
+	 */
 	migrateLegacyImport: (sourceDbPath: string | null, sourceJsonDir: string | null, options?: InvokeOptions) => __TAURI_INVOKE<MigrationReport>("migrate_legacy_import", { sourceDbPath, sourceJsonDir }, options),
 	getMigrationStatus: (options?: InvokeOptions) => __TAURI_INVOKE<MigrationStatus_Serialize>("get_migration_status", undefined, options),
 	getSettings: (options?: InvokeOptions) => __TAURI_INVOKE<AppSettings>("get_settings", undefined, options),

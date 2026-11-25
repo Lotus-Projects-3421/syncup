@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::PathBuf;
 
 use tauri::State;
 
@@ -8,9 +8,16 @@ use crate::storage::migration::{MigrationReport, MigrationStatus};
 use crate::storage::profiles::DeviceProfile;
 use crate::storage::settings::AppSettings;
 
+/// Runs the legacy import off the calling thread.
+///
+/// A synchronous `#[tauri::command]` executes on the main thread, while this
+/// import performs blocking SQLite backup, integrity-check, filesystem and
+/// transaction work whose duration scales with the legacy database size. The
+/// blocking work is therefore moved into `spawn_blocking`, matching the pattern
+/// already used by `commands::backup`.
 #[tauri::command]
 #[specta::specta]
-pub fn migrate_legacy_import(
+pub async fn migrate_legacy_import(
     state: State<'_, AppState>,
     source_db_path: Option<String>,
     source_json_dir: Option<String>,
@@ -19,20 +26,30 @@ pub fn migrate_legacy_import(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(Path::new);
+        .map(PathBuf::from);
 
     let source_json = source_json_dir
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(Path::new);
+        .map(PathBuf::from);
 
-    crate::storage::migration::migrate_legacy_import(
-        &state.db,
-        &state.data_dir,
-        source_db,
-        source_json,
-    )
+    let pool = state.db.clone();
+    let data_dir = state.data_dir.clone();
+
+    tokio::task::spawn_blocking(move || {
+        crate::storage::migration::migrate_legacy_import(
+            &pool,
+            &data_dir,
+            source_db.as_deref(),
+            source_json.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, "[migration] import task failed to join");
+        IpcError::io(&format!("migration task failed: {error}"))
+    })?
     .map_err(|error| {
         tracing::error!(error = %error, "[migration] import operation failed");
         IpcError::migration(&error.to_string())

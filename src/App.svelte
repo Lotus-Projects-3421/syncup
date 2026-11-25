@@ -1,6 +1,8 @@
 <script lang="ts">
   import AppSidebar from "$lib/components/app-sidebar.svelte";
+  import { fetchSettings, saveSettings } from "$lib/services/settings";
   import { navigation } from "$lib/state/navigation.svelte";
+  import { theme } from "$lib/state/theme.svelte";
   import Activity from "./routes/activity.svelte";
   import Dashboard from "./routes/dashboard.svelte";
   import Duplicates from "./routes/duplicates.svelte";
@@ -8,6 +10,30 @@
   import PhoneBackup from "./routes/phone-backup.svelte";
   import Settings from "./routes/settings.svelte";
   import WifiBackup from "./routes/wifi-backup.svelte";
+
+  // main.ts already reconciled the persisted theme before mounting, so the first
+  // effect run must not write anything back. Without this guard a failed
+  // bootstrap fetch could let a stale local cache overwrite the saved theme.
+  let themeSyncInitialized = false;
+
+  async function persistTheme(mode: string): Promise<void> {
+    const current = await fetchSettings();
+    if (!current.ok || current.value.theme === mode) {
+      return;
+    }
+    // Spread the loaded settings so unrelated fields are never dropped.
+    // Failures are already logged by the service layer.
+    await saveSettings({ ...current.value, theme: mode });
+  }
+
+  $effect(() => {
+    const mode = theme.mode;
+    if (!themeSyncInitialized) {
+      themeSyncInitialized = true;
+      return;
+    }
+    void persistTheme(mode);
+  });
 </script>
 
 <div class="flex min-h-screen flex-col bg-background text-foreground md:flex-row">
