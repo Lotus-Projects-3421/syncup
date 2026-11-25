@@ -26,11 +26,15 @@
 //! retain quota for the session lifetime; failures/cancellation release the
 //! reservation and remove staged remnants.
 //!
-//! # Phase 6 scope and limitations
-//! Uploads land in per-session staging ONLY; final destination processing and
-//! processed-state DB writes are Phase 9. Manifest diff is existence + size
-//! against `destination_root` (read-only). mtime comparison needs the DB
-//! integration and is deferred; `mtime_ns` is accepted but not yet used.
+//! # Lifecycle and remaining limitations
+//! Uploads land in per-session staging. An explicit `stop()` quiesces the
+//! listener, drains in-flight uploads, then publishes staged files into
+//! `destination_root` through the Phase 4 verified engine; staging is removed
+//! only after every file publishes successfully. Cancellation and TTL expiry
+//! deliberately skip finalization and discard staging. Finalization is
+//! sequential, has no crash-resume, and reports aggregate counts only.
+//! Manifest diff is existence + size against `destination_root`; mtime
+//! comparison and processed-state DB writes are still deferred.
 //! No chunked resumption (PLAN §11): interrupted files must be re-uploaded.
 
 use std::collections::HashMap;
@@ -141,6 +145,10 @@ struct Session {
     limits: WifiLimits,
     expires_at: Instant,
     cancel: CancellationToken,
+    /// Quiesces the HTTP listener and intake. Kept separate from `cancel` so an
+    /// explicit stop can drain the server while leaving the finalization and
+    /// file-engine cancellation token unfired.
+    shutdown: CancellationToken,
     job: JobHandle,
     quota: Mutex<Quota>,
     bucket: Mutex<Bucket>,
@@ -280,6 +288,7 @@ impl WifiSessionManager {
             limits: limits.clone(),
             expires_at: Instant::now() + limits.ttl,
             cancel: cancel.clone(),
+            shutdown: CancellationToken::new(),
             job: job.clone(),
             quota: Mutex::new(Quota::default()),
             bucket: Mutex::new(Bucket {
@@ -298,7 +307,7 @@ impl WifiSessionManager {
         });
 
         let app = build_router(session.clone());
-        let shutdown = cancel.clone();
+        let shutdown = session.shutdown.clone();
         let serve_task = tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app)
                 .with_graceful_shutdown(async move { shutdown.cancelled().await })
@@ -352,25 +361,64 @@ impl WifiSessionManager {
         let Some(session) = session else {
             return Ok(());
         };
-        session.cancel.cancel();
-        let mut task = lock_mutex(&session.serve_task).take();
-        if let Some(task) = task.as_mut() {
-            let _ = tokio::time::timeout(SHUTDOWN_GRACE, &mut *task).await;
-            task.abort();
+        // An explicit stop must quiesce the listener WITHOUT firing the job
+        // cancel token: that same token drives finalization and the file engine,
+        // so firing it here would abort `finalize_blocking` on its first file
+        // boundary and silently discard every upload. Cancellation and expiry
+        // fire both tokens and skip finalization, preserving the original
+        // discard-and-clean semantics asserted by the wifi_security suite.
+        let explicit_stop = status == JobStatus::Completed;
+        session.shutdown.cancel();
+        if !explicit_stop {
+            session.cancel.cancel();
         }
 
-        // Finalize staged files to destination before removing staging.
-        // Only finalize on explicit user stop (Completed) when the cancel token
-        // has NOT been fired. Cancelled/expired sessions skip finalization and
-        // fall through to the original staging-cleanup path so that existing
-        // wifi_security tests continue to pass and no data is silently lost.
-        let finalize_result = if status == JobStatus::Completed && !session.cancel.is_cancelled() {
-            self.finalize_and_publish(&session).await
+        let mut task = lock_mutex(&session.serve_task).take();
+        let mut server_drained = true;
+        if let Some(task) = task.as_mut() {
+            if tokio::time::timeout(SHUTDOWN_GRACE, &mut *task)
+                .await
+                .is_err()
+            {
+                server_drained = false;
+                task.abort();
+            }
+        }
+
+        let finalize_result = if explicit_stop {
+            // Wait for every in-flight upload to release its concurrency permit
+            // before walking staging. An aborted connection task can leave a
+            // detached blocking copy still writing after its permit is released,
+            // so a timeout is a failure: staging is preserved, never deleted
+            // underneath a live writer.
+            let permits = session.limits.max_concurrent_uploads as u32;
+            let drained =
+                tokio::time::timeout(SHUTDOWN_GRACE, session.uploads.acquire_many(permits)).await;
+            match drained {
+                Ok(Ok(_upload_guard)) => {
+                    if server_drained {
+                        self.finalize_and_publish(&session).await
+                    } else {
+                        Err(IpcError::io("server did not drain; staging preserved"))
+                    }
+                }
+                Ok(Err(e)) => Err(IpcError::io(&format!(
+                    "upload concurrency limiter closed: {e}"
+                ))),
+                Err(_) => Err(IpcError::io("uploads still in flight; staging preserved")),
+            }
         } else {
             Ok(())
         };
 
-        // Only remove staging if finalization succeeded
+        // Evaluated before the token is fired below, because afterwards every
+        // path would look cancelled. A user cancel observed mid-finalization is
+        // Cancelled rather than Failed, and staging is kept because some files
+        // may already be published in the destination.
+        let cancelled_during_finalize = finalize_result.is_err() && session.cancel.is_cancelled();
+
+        // Only remove staging when nothing was left unpublished. The cancel and
+        // expiry branch yields Ok(()) here, so it still wipes staging.
         let should_remove_staging = finalize_result.is_ok();
 
         if should_remove_staging {
@@ -387,20 +435,31 @@ impl WifiSessionManager {
             tracing::warn!(
                 session_id = %session.session_id,
                 staging_dir = %session.staging_dir.display(),
-                "finalization failed; staging preserved for manual inspection"
+                "finalization did not complete; staging preserved for manual inspection"
             );
         }
 
-        let final_status = match finalize_result {
-            Ok(()) => status,
+        // Release the watcher task and any straggler upload pump. The slot is
+        // already empty, so the watcher's stop_session call returns early and
+        // cannot overwrite the terminal status set below.
+        session.cancel.cancel();
+
+        match finalize_result {
+            Ok(()) => {
+                session.job.finish(status, None);
+                Ok(())
+            }
+            Err(e) if cancelled_during_finalize => {
+                session
+                    .job
+                    .finish(JobStatus::Cancelled, Some(e.to_string()));
+                Ok(())
+            }
             Err(e) => {
                 session.job.finish(JobStatus::Failed, Some(e.to_string()));
-                return Err(e);
+                Err(e)
             }
-        };
-
-        session.job.finish(final_status, None);
-        Ok(())
+        }
     }
 
     /// Walks the staging directory and publishes each file to the destination
@@ -522,6 +581,13 @@ fn collect_staged_files(
         if file_type.is_dir() {
             collect_staged_files(root, &path, out)?;
         } else if file_type.is_file() {
+            // Never publish an engine temp file as user data. A detached blocking
+            // copy can still be writing one when staging is walked.
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(".syncup-part-") || name_str.starts_with(".syncup-move-") {
+                continue;
+            }
             let rel = path
                 .strip_prefix(root)
                 .map_err(|e| IpcError::io(&format!("cannot compute relative path: {e}")))?;
@@ -545,7 +611,10 @@ fn build_router(session: Arc<Session>) -> Router {
 }
 
 async fn guard(State(session): State<Arc<Session>>, req: Request, next: Next) -> Response {
-    if session.cancel.is_cancelled() || Instant::now() >= session.expires_at {
+    if session.cancel.is_cancelled()
+        || session.shutdown.is_cancelled()
+        || Instant::now() >= session.expires_at
+    {
         return error_response(
             StatusCode::UNAUTHORIZED,
             IpcError::wifi_auth_failed("session is not active"),
@@ -658,7 +727,7 @@ struct UploadFailure {
 }
 
 async fn upload_handler(State(session): State<Arc<Session>>, req: Request) -> Response {
-    if session.cancel.is_cancelled() {
+    if session.cancel.is_cancelled() || session.shutdown.is_cancelled() {
         return error_response(
             StatusCode::UNAUTHORIZED,
             IpcError::wifi_auth_failed("session stopped"),
