@@ -35,6 +35,15 @@ export const commands = {
 	getScanResults: (jobId: string, options?: InvokeOptions) => __TAURI_INVOKE<DuplicateGroup[]>("get_scan_results", { jobId }, options),
 	moveDuplicates: (scanJobId: string, confirmed: boolean, options?: InvokeOptions) => __TAURI_INVOKE<string>("move_duplicates", { scanJobId, confirmed }, options),
 	undoDuplicates: (manifestId: string, options?: InvokeOptions) => __TAURI_INVOKE<string>("undo_duplicates", { manifestId }, options),
+	/**
+	 *  List persisted duplicate-move manifests so a caller can obtain the manifest
+	 *  id required by `undo_duplicates`. Additive and read-only: it does not change
+	 *  the `move_duplicates` or `undo_duplicates` contracts.
+	 * 
+	 *  Filesystem reads run in `spawn_blocking` so the async runtime is never
+	 *  blocked.
+	 */
+	listDedupManifests: (options?: InvokeOptions) => __TAURI_INVOKE<DedupManifestSummary[]>("list_dedup_manifests", undefined, options),
 };
 
 /* Types */
@@ -64,6 +73,39 @@ export type ConflictMode =
 "overwrite" | 
 /**  Skip the operation if the target file already exists. */
 "skip";
+
+/**
+ *  Read-only summary of one persisted duplicate-move manifest.
+ * 
+ *  `move_duplicates` returns a job id, while `undo_duplicates` requires the
+ *  manifest id that `run_move` generates internally. This summary is how a
+ *  caller discovers that id without guessing it.
+ * 
+ *  Counts partition every `OperationStatus` variant exactly once:
+ *  `completed_ops` = Completed, `undone_ops` = Undone, `failed_ops` = Failed,
+ *  `blocked_ops` = UndoBlocked, `pending_ops` = Pending + UndoPending (not yet
+ *  resolved), `attention_ops` = Ambiguous + Lost (need user review).
+ */
+export type DedupManifestSummary = {
+	manifestId: string,
+	/**  RFC3339 timestamp recorded when the manifest was created. */
+	createdAt: string,
+	totalOps: number,
+	completedOps: number,
+	undoneOps: number,
+	failedOps: number,
+	blockedOps: number,
+	pendingOps: number,
+	attentionOps: number,
+	/**
+	 *  ADVISORY ONLY: true when at least one operation is still in the
+	 *  Completed state, which is exactly the set `run_undo` selects. It does
+	 *  NOT guarantee that undo will succeed. Undo re-validates every path,
+	 *  refuses occupied originals and modified quarantine files, and may mark
+	 *  operations UndoBlocked or Failed. Never present this as a promise.
+	 */
+	potentiallyUndoable: boolean,
+};
 
 /**  Opaque identifier for a discovered MTP device (the GVFS serial portion). */
 export type DeviceId = string;

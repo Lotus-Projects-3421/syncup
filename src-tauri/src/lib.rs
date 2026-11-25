@@ -42,7 +42,8 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::dedup::scan_duplicates,
         commands::dedup::get_scan_results,
         commands::dedup::move_duplicates,
-        commands::dedup::undo_duplicates
+        commands::dedup::undo_duplicates,
+        commands::dedup::list_dedup_manifests
     ])
 }
 

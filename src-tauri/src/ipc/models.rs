@@ -179,3 +179,41 @@ pub struct ManifestEntry {
     pub expected_hash: String,
     pub status: OperationStatus,
 }
+
+/// Read-only summary of one persisted duplicate-move manifest.
+///
+/// `move_duplicates` returns a job id, while `undo_duplicates` requires the
+/// manifest id that `run_move` generates internally. This summary is how a
+/// caller discovers that id without guessing it.
+///
+/// Counts partition every `OperationStatus` variant exactly once:
+/// `completed_ops` = Completed, `undone_ops` = Undone, `failed_ops` = Failed,
+/// `blocked_ops` = UndoBlocked, `pending_ops` = Pending + UndoPending (not yet
+/// resolved), `attention_ops` = Ambiguous + Lost (need user review).
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DedupManifestSummary {
+    pub manifest_id: String,
+    /// RFC3339 timestamp recorded when the manifest was created.
+    pub created_at: String,
+    #[specta(type = specta_typescript::Number)]
+    pub total_ops: u64,
+    #[specta(type = specta_typescript::Number)]
+    pub completed_ops: u64,
+    #[specta(type = specta_typescript::Number)]
+    pub undone_ops: u64,
+    #[specta(type = specta_typescript::Number)]
+    pub failed_ops: u64,
+    #[specta(type = specta_typescript::Number)]
+    pub blocked_ops: u64,
+    #[specta(type = specta_typescript::Number)]
+    pub pending_ops: u64,
+    #[specta(type = specta_typescript::Number)]
+    pub attention_ops: u64,
+    /// ADVISORY ONLY: true when at least one operation is still in the
+    /// Completed state, which is exactly the set `run_undo` selects. It does
+    /// NOT guarantee that undo will succeed. Undo re-validates every path,
+    /// refuses occupied originals and modified quarantine files, and may mark
+    /// operations UndoBlocked or Failed. Never present this as a promise.
+    pub potentially_undoable: bool,
+}
