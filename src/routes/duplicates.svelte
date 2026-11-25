@@ -50,6 +50,12 @@
   let undoError = $state<AppError | null>(null);
   let undoJobId = $state<string | null>(null);
   let undoResultManifest = $state<DedupManifestSummary | null>(null);
+  let moveManifestError = $state<AppError | null>(null);
+  let undoManifestError = $state<AppError | null>(null);
+  let moveBaselineIds = $state<string[] | null>(null);
+  let moveManifestCreated = $state(false);
+  let cancelledMove = $state(false);
+  let cancelledUndo = $state(false);
 
   // Re-entry state
   let attaching = $state(true);
@@ -88,6 +94,12 @@
     scanStarting = true;
     scanError = null;
     groups = [];
+    moveManifestError = null;
+    undoManifestError = null;
+    moveBaselineIds = null;
+    moveManifestCreated = false;
+    cancelledMove = false;
+    cancelledUndo = false;
     const result = await startScan({ scanRoots, excludePatterns: scanExcludes });
     if (result.ok) {
       jobId = result.value;
@@ -110,6 +122,14 @@
     if (!canStartMove || jobId !== null) return;
     moveStarting = true;
     moveError = null;
+    moveManifestError = null;
+    moveManifestCreated = false;
+
+    const baseline = await fetchManifests();
+    if (baseline.ok) {
+      moveBaselineIds = baseline.value.map((m) => m.manifestId);
+    }
+
     const result = await startMove(scanJobId!, true);
     if (result.ok) {
       moveJobId = result.value;
@@ -199,15 +219,33 @@
       }
       // If this was a move, refresh manifests
       if (completedJobId === moveJobId) {
-        await loadManifests();
+        const manifestResult = await fetchManifests();
+        if (manifestResult.ok && moveBaselineIds !== null) {
+          const known = new Set(moveBaselineIds);
+          const created = manifestResult.value.filter((m) => !known.has(m.manifestId));
+          if (created.length === 1) {
+            moveManifestCreated = true;
+          } else if (created.length === 0) {
+            moveManifestError = { code: "UNKNOWN", message: "No new readable manifest was found. The move outcome could not be verified; files may still have been moved." };
+          } else {
+            moveManifestError = { code: "UNKNOWN", message: `${created.length} new manifests appeared. The move outcome could not be verified; files may still have been moved.` };
+          }
+        } else if (!manifestResult.ok) {
+          moveManifestError = manifestResult.error;
+        }
         moveJobId = null;
+        moveBaselineIds = null;
       }
       // If this was an undo, refresh the specific manifest
       if (completedJobId === undoJobId) {
-        await loadManifests();
-        const updated = manifests.find((m) => m.manifestId === selectedManifestId);
-        if (updated) {
-          undoResultManifest = updated;
+        const manifestResult = await fetchManifests();
+        if (!manifestResult.ok) {
+          undoManifestError = manifestResult.error;
+        } else {
+          const updated = manifests.find((m) => m.manifestId === selectedManifestId);
+          if (updated) {
+            undoResultManifest = updated;
+          }
         }
         undoJobId = null;
       }
@@ -216,9 +254,11 @@
     } else if (result.value.status === "failed" || result.value.status === "cancelled") {
       stopPolling();
       if (jobId === moveJobId) {
+        cancelledMove = result.value.status === "cancelled";
         moveJobId = null;
       }
       if (jobId === undoJobId) {
+        cancelledUndo = result.value.status === "cancelled";
         undoJobId = null;
       }
       jobId = null;
@@ -384,9 +424,22 @@
           {#if scanJobId && groups.length > 0}
             <p class="mt-2 text-sm">Scan found {groups.length} duplicate group{groups.length === 1 ? "" : "s"}.</p>
           {:else if moveInProgress}
-            <p class="mt-2 text-sm">Duplicates moved to quarantine. Check the Manifest History below to undo if needed.</p>
-          {:else if undoInProgress && undoResultManifest}
-            <div class="mt-2 space-y-2">
+            {#if moveManifestError}
+              <p class="mt-2 text-sm text-destructive">
+                {moveManifestError.message}
+              </p>
+            {:else if moveManifestCreated}
+              <p class="mt-2 text-sm">Duplicates moved to quarantine. Check the Manifest History below to undo if needed.</p>
+            {:else}
+              <p class="mt-2 text-sm text-muted-foreground">Move completed, but the manifest record could not be verified.</p>
+            {/if}
+          {:else if undoInProgress}
+            {#if undoManifestError}
+              <p class="mt-2 text-sm text-destructive">
+                {undoManifestError.message} The undo outcome could not be verified; some files may still have been restored.
+              </p>
+            {:else if undoResultManifest}
+              <div class="mt-2 space-y-2">
               <p class="text-sm">Restore completed for manifest {undoResultManifest.manifestId.slice(0, 8)}…</p>
               <dl class="grid grid-cols-2 gap-2 text-sm">
                 <div>
@@ -417,7 +470,16 @@
                 </p>
               {/if}
             </div>
+            {/if}
           {/if}
+        {:else if job.status === "cancelled" && cancelledMove}
+          <p class="mt-2 text-sm text-muted-foreground">
+            Move cancelled at a file boundary. Files already moved to quarantine remain there.
+          </p>
+        {:else if job.status === "cancelled" && cancelledUndo}
+          <p class="mt-2 text-sm text-muted-foreground">
+            Undo cancelled at a file boundary. Files already restored remain restored, while remaining operations were not necessarily completed.
+          </p>
         {:else if job.status === "cancelled"}
           <p class="mt-2 text-sm text-muted-foreground">Job cancelled. No files were changed.</p>
         {:else if job.lastError}
