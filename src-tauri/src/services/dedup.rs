@@ -462,6 +462,19 @@ pub async fn run_move(
             continue;
         }
 
+        // The quarantine destination lives under dedup/<manifest_id>/root-<idx>/<rel_path>.
+        // Only the manifest's own parent directory is created by write_manifest_atomic, so the
+        // per-file destination parent must exist before move_verified attempts its rename:
+        // renameat2 into a missing parent fails with ENOENT (not EXDEV), which move_verified
+        // surfaces as an I/O error rather than falling back to the cross-device copy path.
+        if let Some(parent) = dest_path.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                current_manifest.ops[i].status = OperationStatus::Failed(e.to_string());
+                write_manifest_atomic(&manifest_path, &current_manifest)?;
+                continue;
+            }
+        }
+
         let dest = Destination {
             final_path: dest_path.clone(),
             conflict_mode: crate::domain::conflict::ConflictMode::Skip,
