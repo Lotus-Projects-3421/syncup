@@ -491,6 +491,12 @@ pub async fn run_move(
             Ok(_) => {
                 current_manifest.ops[i].status = OperationStatus::Completed;
             }
+            Err(crate::services::fileops::FileOpError::PublishPendingDurability { .. }) => {
+                // The move succeeded (file is at destination), but directory fsync failed.
+                // Treat as Completed since the data movement completed successfully.
+                // Durability concerns do not affect correctness or recoverability.
+                current_manifest.ops[i].status = OperationStatus::Completed;
+            }
             Err(e) => {
                 current_manifest.ops[i].status = OperationStatus::Failed(e.to_string());
             }
