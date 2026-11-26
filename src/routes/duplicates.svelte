@@ -27,12 +27,19 @@
   // Job state (shared by scan, move, undo)
   let jobId = $state<string | null>(null);
   let job = $state<Job_Serialize | null>(null);
+  // Which operation the retained terminal `job` belongs to. Needed because the
+  // per-operation ids are cleared as soon as the job reaches a terminal state.
+  let lastCompletedKind = $state<"scan" | "move" | "undo" | null>(null);
   let jobError = $state<AppError | null>(null);
   let cancelling = $state(false);
   let cancelError = $state<AppError | null>(null);
 
   // Scan results
   let groups = $state<DuplicateGroup[]>([]);
+  // The backend keeps scan results keyed by the scan job id. Keep that id after
+  // the job reaches a terminal state so "Move Duplicates" can reference it;
+  // `jobId` is cleared when polling observes completion.
+  let lastScanJobId = $state<string | null>(null);
 
   // Move state
   let moveConfirmed = $state(false);
@@ -76,7 +83,7 @@
 
   // Move derived
   let canStartMove = $derived(
-    !moveStarting && groups.length > 0 && moveConfirmed && jobId === null
+    !moveStarting && groups.length > 0 && moveConfirmed && jobId === null && lastScanJobId !== null
   );
 
   // Manifest derived
@@ -102,6 +109,7 @@
     cancelledUndo = false;
     const result = await startScan({ scanRoots, excludePatterns: scanExcludes });
     if (result.ok) {
+      lastScanJobId = result.value;
       jobId = result.value;
       job = null;
       startPolling();
@@ -130,7 +138,7 @@
       moveBaselineIds = baseline.value.map((m) => m.manifestId);
     }
 
-    const result = await startMove(scanJobId!, true);
+    const result = await startMove(lastScanJobId!, true);
     if (result.ok) {
       moveJobId = result.value;
       jobId = result.value;
@@ -142,8 +150,6 @@
     }
     moveStarting = false;
   }
-
-  let scanJobId = $derived(jobId !== null && !moveJobId && !undoJobId ? jobId : null);
 
   async function loadManifests(): Promise<void> {
     manifestsLoading = true;
@@ -213,46 +219,60 @@
     if (result.value.status === "completed") {
       stopPolling();
       const completedJobId = jobId;
+      lastCompletedKind =
+        completedJobId === moveJobId ? "move" : completedJobId === undoJobId ? "undo" : "scan";
       // If this was a scan, load results
-      if (completedJobId === scanJobId) {
+      if (completedJobId === lastScanJobId) {
         await loadScanResults(completedJobId);
       }
       // If this was a move, refresh manifests
       if (completedJobId === moveJobId) {
         const manifestResult = await fetchManifests();
-        if (manifestResult.ok && moveBaselineIds !== null) {
-          const known = new Set(moveBaselineIds);
-          const created = manifestResult.value.filter((m) => !known.has(m.manifestId));
-          if (created.length === 1) {
-            moveManifestCreated = true;
-          } else if (created.length === 0) {
-            moveManifestError = { code: "UNKNOWN", message: "No new readable manifest was found. The move outcome could not be verified; files may still have been moved." };
-          } else {
-            moveManifestError = { code: "UNKNOWN", message: `${created.length} new manifests appeared. The move outcome could not be verified; files may still have been moved.` };
+        if (manifestResult.ok) {
+          // Show the newly written manifest immediately; otherwise the user
+          // would have to press Refresh before it could be selected for undo.
+          manifests = manifestResult.value;
+          if (moveBaselineIds !== null) {
+            const known = new Set(moveBaselineIds);
+            const created = manifestResult.value.filter((m) => !known.has(m.manifestId));
+            if (created.length === 1) {
+              moveManifestCreated = true;
+            } else if (created.length === 0) {
+              moveManifestError = { code: "UNKNOWN", message: "No new readable manifest was found. The move outcome could not be verified; files may still have been moved." };
+            } else {
+              moveManifestError = { code: "UNKNOWN", message: `${created.length} new manifests appeared. The move outcome could not be verified; files may still have been moved.` };
+            }
           }
-        } else if (!manifestResult.ok) {
+        } else {
           moveManifestError = manifestResult.error;
         }
         moveJobId = null;
         moveBaselineIds = null;
       }
-      // If this was an undo, refresh the specific manifest
+      // If this was an undo, reload the manifest list and read the summary
+      // from the reloaded data rather than the pre-undo snapshot.
       if (completedJobId === undoJobId) {
         const manifestResult = await fetchManifests();
         if (!manifestResult.ok) {
           undoManifestError = manifestResult.error;
         } else {
+          manifests = manifestResult.value;
           const updated = manifests.find((m) => m.manifestId === selectedManifestId);
           if (updated) {
             undoResultManifest = updated;
+          } else {
+            undoManifestError = { code: "UNKNOWN", message: "The updated manifest could not be found after the restore." };
           }
         }
         undoJobId = null;
       }
+      // Keep `job` so the terminal summary (including any manifest-verification
+      // warning) remains visible. Only the live job id is cleared.
       jobId = null;
-      job = null;
     } else if (result.value.status === "failed" || result.value.status === "cancelled") {
       stopPolling();
+      lastCompletedKind =
+        jobId === moveJobId ? "move" : jobId === undoJobId ? "undo" : "scan";
       if (jobId === moveJobId) {
         cancelledMove = result.value.status === "cancelled";
         moveJobId = null;
@@ -262,7 +282,6 @@
         undoJobId = null;
       }
       jobId = null;
-      job = null;
     }
   }
 
@@ -417,13 +436,17 @@
     {#if job !== null && isTerminal && !isActive}
       <Card>
         <h2 class="text-base font-semibold">
-          {moveInProgress ? "Move" : undoInProgress ? "Restore" : "Scan"}
+          {lastCompletedKind === "move" ? "Move" : lastCompletedKind === "undo" ? "Restore" : "Scan"}
           {job.status === "completed" ? "Completed" : job.status === "cancelled" ? "Cancelled" : "Failed"}
         </h2>
         {#if job.status === "completed"}
-          {#if scanJobId && groups.length > 0}
-            <p class="mt-2 text-sm">Scan found {groups.length} duplicate group{groups.length === 1 ? "" : "s"}.</p>
-          {:else if moveInProgress}
+          {#if lastCompletedKind === "scan"}
+            {#if groups.length > 0}
+              <p class="mt-2 text-sm">Scan found {groups.length} duplicate group{groups.length === 1 ? "" : "s"}.</p>
+            {:else}
+              <p class="mt-2 text-sm text-muted-foreground">Scan completed. No duplicate groups were found.</p>
+            {/if}
+          {:else if lastCompletedKind === "move"}
             {#if moveManifestError}
               <p class="mt-2 text-sm text-destructive">
                 {moveManifestError.message}
@@ -433,7 +456,7 @@
             {:else}
               <p class="mt-2 text-sm text-muted-foreground">Move completed, but the manifest record could not be verified.</p>
             {/if}
-          {:else if undoInProgress}
+          {:else if lastCompletedKind === "undo"}
             {#if undoManifestError}
               <p class="mt-2 text-sm text-destructive">
                 {undoManifestError.message} The undo outcome could not be verified; some files may still have been restored.
@@ -447,8 +470,8 @@
                   <dd class="font-medium">{undoResultManifest.undoneOps}</dd>
                 </div>
                 <div>
-                  <dt class="text-muted-foreground">Already restored</dt>
-                  <dd class="font-medium">{undoResultManifest.undoneOps}</dd>
+                  <dt class="text-muted-foreground">Still in quarantine</dt>
+                  <dd class="font-medium">{undoResultManifest.completedOps}</dd>
                 </div>
                 <div>
                   <dt class="text-muted-foreground">Blocked</dt>
