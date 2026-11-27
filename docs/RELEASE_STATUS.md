@@ -3,9 +3,9 @@
 **Version:** 2.0.0
 **Release date:** 2026-11-27
 **Platform:** Linux x86_64
-**Branch:** `v2-migration`
+**Branch:** `main`
 
-This document records the release evidence available during release preparation. It distinguishes automated checks, physical workflow tests, and packaging verification.
+SyncUp V2.0.0 was successfully released on 2026-11-27. This document records the automated checks, physical workflow tests, packaging verification, and known limitations.
 
 ## Feature validation
 
@@ -34,7 +34,7 @@ The recorded test result was **110 passed and 4 ignored**. The ignored tests wer
 
 Frontend checks and production build were also used during packaging.
 
-These results describe recorded local verification. They do not establish that GitHub Actions has passed for the final release commit.
+GitHub Actions run `45983933149` passed on the release commit `f0e5954`.
 
 ## Release artifacts
 
@@ -56,9 +56,7 @@ The older `SyncUp_2.0.0_amd64.deb` was generated before the product-name change 
 
 ## CI
 
-The repository contains a GitHub Actions workflow for frontend checks, Rust formatting, compilation, linting, and tests. A Specta binding consistency check is included in the release-preparation change.
-
-The workflow must run successfully on GitHub before CI can be marked as release-verified.
+The repository contains a GitHub Actions workflow for frontend checks, Rust formatting, compilation, linting, and tests. The workflow includes the Specta binding consistency check. GitHub Actions run `45983933149` completed successfully.
 
 ## Release checklist
 
@@ -72,7 +70,7 @@ The workflow must run successfully on GitHub before CI can be marked as release-
 - [x] Product name changed to SyncUp V2.
 - [x] Legacy SyncUp 1.4.1 desktop entry preserved.
 - [x] Wi-Fi security limitation documented.
-- [ ] Documentation changes committed.
-- [ ] CI workflow verified on GitHub.
-- [ ] Release tag created and pushed.
-- [ ] GitHub release published with final packages and checksums.
+- [x] Documentation changes prepared for the release.
+- [x] CI workflow verified on GitHub.
+- [x] Release tag `v2.0.0` created and pushed.
+- [x] GitHub release published with final packages and checksums.

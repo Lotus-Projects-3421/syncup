@@ -36,7 +36,7 @@ VIRTUAL environmentr start.txt
 README and CONTEXT HANDOFF.md
 
 # Local archive of old releases, notes, and profiles (not for GitHub)
-archive/
+/archive/
 
 # App user data
 profiles-data/

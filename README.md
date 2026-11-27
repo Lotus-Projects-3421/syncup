@@ -46,7 +46,7 @@ The release has been built and launched on Zorin OS 18.1 (Ubuntu 24.04-based).
 ### Legacy data import
 
 - Import supported settings and backup history from the original SyncUp application.
-- The original v1 application is a separate legacy product.
+- The original Python/Flet v1.4.1 source is retained in the repository for legacy data migration, compatibility, and historical reference. It is not the V2 application runtime.
 
 ## Installation
 

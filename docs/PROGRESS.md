@@ -1,8 +1,8 @@
 # SyncUp V2 — Progress and Release Log
 
-**Current phase:** Release preparation
+**Release status:** Published
 **Version:** 2.0.0
-**Branch:** `v2-migration`
+**Branch:** `main`
 
 ## Completed implementation
 
@@ -62,15 +62,15 @@
 - Final package identity: `sync-up-v2`.
 - Application identifier retained: `io.github.lotus-projects-3421.syncup`.
 
-## Release preparation
+## Release completed
 
-Remaining tasks:
+- GitHub Actions run `45983933149` passed.
+- Annotated tag `v2.0.0` created and pushed.
+- Debian package and AppImage published.
+- SHA256 checksums published and verified.
+- GitHub release: https://github.com/Lotus-Projects-3421/syncup/releases/tag/v2.0.0
+- Default branch: `main`.
 
-1. Finalize and commit release documentation.
-2. Run and verify GitHub Actions for the release commit.
-3. Create and push the `v2.0.0` tag.
-4. Publish the two final Linux artifacts and SHA256 checksums on GitHub.
-5. Record the published release URL and final repository state.
 
 ## Scope control
 
