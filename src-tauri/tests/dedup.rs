@@ -306,8 +306,7 @@ async fn manifest_fsync_after_each_move() {
     create_file(root, "a.txt", content);
     create_file(root, "b.txt", content);
     create_file(root, "c.txt", content);
-    let fixed =
-        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let fixed = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
     for name in ["a.txt", "b.txt", "c.txt"] {
         force_mtime(&root.join(name), fixed);
     }
@@ -451,8 +450,7 @@ async fn partial_move_failure_recoverable() {
     create_file(root, "a.txt", content);
     create_file(root, "b.txt", content);
     create_file(root, "c.txt", content);
-    let fixed =
-        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let fixed = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
     for name in ["a.txt", "b.txt", "c.txt"] {
         force_mtime(&root.join(name), fixed);
     }
@@ -568,8 +566,7 @@ async fn undo_restores_all() {
     create_file(root, "a.txt", content);
     create_file(root, "b.txt", content);
     create_file(root, "c.txt", content);
-    let fixed =
-        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let fixed = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
     for name in ["a.txt", "b.txt", "c.txt"] {
         force_mtime(&root.join(name), fixed);
     }
@@ -615,9 +612,14 @@ async fn undo_restores_all() {
     assert!(root.join("a.txt").exists(), "retained file must remain");
 
     let (undo_handle, _) = dummy_handle();
-    run_undo(manifest_id.clone(), &undo_handle, data_dir.path(), cancel.clone())
-        .await
-        .unwrap();
+    run_undo(
+        manifest_id.clone(),
+        &undo_handle,
+        data_dir.path(),
+        cancel.clone(),
+    )
+    .await
+    .unwrap();
 
     let manifest_str = fs::read_to_string(&manifest_path).unwrap();
     let manifest: Manifest = serde_json::from_str(&manifest_str).unwrap();
@@ -658,8 +660,7 @@ async fn undo_idempotent() {
     create_file(root, "a.txt", content);
     create_file(root, "b.txt", content);
     create_file(root, "c.txt", content);
-    let fixed =
-        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let fixed = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
     for name in ["a.txt", "b.txt", "c.txt"] {
         force_mtime(&root.join(name), fixed);
     }
@@ -747,9 +748,16 @@ async fn undo_collision_aware_skips_blocked_op() {
         .unwrap();
 
     let (move_handle, _) = dummy_handle();
-    run_move(job_id.clone(), true, &move_handle, &store, &data_dir, cancel.clone())
-        .await
-        .unwrap();
+    run_move(
+        job_id.clone(),
+        true,
+        &move_handle,
+        &store,
+        &data_dir,
+        cancel.clone(),
+    )
+    .await
+    .unwrap();
 
     let dedup_dir = data_dir.join("dedup");
     let manifest_path = manifest_json_path(&dedup_dir);
@@ -801,8 +809,7 @@ async fn cross_filesystem_move_uses_copy_verified_and_removes_source() {
         shm.exists(),
         "/dev/shm is required on this platform to exercise the EXDEV branch of move_verified"
     );
-    let data_root =
-        tempfile::TempDir::new_in(shm).expect("create quarantine TempDir on /dev/shm");
+    let data_root = tempfile::TempDir::new_in(shm).expect("create quarantine TempDir on /dev/shm");
     let data_dev = fs::metadata(data_root.path()).unwrap().dev();
     assert_ne!(
         source_dev, data_dev,
