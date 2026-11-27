@@ -1,59 +1,78 @@
-# SyncUp v2 — Release Status
+# SyncUp V2 — Release Status
 
-**Version:** 2.0.0-pre
-**Date:** 2026-11-26
-**Target:** Linux Desktop
+**Version:** 2.0.0
+**Release date:** 2026-11-27
+**Platform:** Linux x86_64
+**Branch:** `v2-migration`
 
-This document tracks the honest readiness of SyncUp v2 for release. It distinguishes between code existence, automated verification, and real-world validation.
+This document records the release evidence available during release preparation. It distinguishes automated checks, physical workflow tests, and packaging verification.
 
-## Feature Matrix
+## Feature validation
 
-| Feature | Status | Automated Tests | Manual Validation | Notes |
-| :--- | :--- | :--- | :--- | :--- |
-| **App Shell / Nav** | ✅ Implemented | ✅ `npm run check` | ⚠️ Basic | Svelte 5, Tailwind, Routing. |
-| **File Safety Engine** | ✅ Implemented | ✅ `fileops.rs` | N/A | Atomic publish, verify, fsync. Core logic tested. |
-| **Storage / Migration** | ✅ Implemented | ✅ `migration.rs` | ⚠️ Synthetic | WAL-safe snapshot, JSON import. Tested with fixtures. |
-| **Phone Backup (MTP)** | ✅ Implemented | ⚠️ Pipeline only | ❌ **Required** | Linux GVFS. Needs real Android phone test. |
-| **Wi-Fi Backup** | ✅ Implemented | ✅ `wifi_security.rs` | ❌ **Required** | HTTP/LAN. 38 tests pass. Needs real phone upload test. |
-| **Takeout Organizer** | ✅ Implemented | ⚠️ Unit only | ❌ **Required** | ZIP streaming, date logic. Needs real Takeout ZIP test. |
-| **Duplicate Finder** | ✅ Implemented | ❌ **EMPTY** | ❌ **Required** | **BLOCKER:** 21 empty test bodies. Logic exists but unverified by automation. |
-| **Dashboard** | ✅ Implemented | ✅ `npm run check` | ⚠️ Basic | Health, recent jobs. |
-| **Settings** | ✅ Implemented | ✅ `npm run check` | ⚠️ Basic | Theme, window size, legacy import UI. |
-| **Packaging** | ⚠️ Configured | N/A | ❌ **Required** | `tauri.conf.json` set. No verified AppImage/deb run yet. |
-| **CI/CD** | ❌ **Outdated** | N/A | N/A | Runs Python v1 tests. Needs update for Rust/Node. |
+| Feature | Validation evidence | Status |
+|---|---|---|
+| Application shell and navigation | Application launched successfully | Passed |
+| File safety engine | Automated file-operation tests | Passed |
+| Android MTP backup | Physical Android device; 610 files copied, zero reported as not copied, with BLAKE2b verification | Passed |
+| Wi-Fi backup | User-tested QR pairing and photo/video upload from phone to PC | Passed |
+| Google Takeout Organizer | User-tested approximately 1 GB Takeout archive from 2018; photos organized by month | Passed |
+| Duplicate Finder | Three identical files tested; two moved to quarantine and hash-verified, then restored | Passed |
+| Debian package | Package installed and SyncUp V2 launched from Applications menu | Passed |
+| AppImage | Runtime check and application launch succeeded | Passed |
 
-## Release Blockers
+## Automated verification
 
-1.  **Dedup Test Coverage:** `src-tauri/tests/dedup.rs` has 21 empty test functions. We cannot claim safety for a destructive (move) workflow without automated verification.
-2.  **Real-Device Validation:** MTP and Wi-Fi flows have never been tested with a physical Android phone in this V2 build.
-3.  **Packaging Verification:** No clean-install test of a built artifact (AppImage/deb).
-4.  **CI Configuration:** CI does not run V2 checks.
-5.  **Documentation:** README/ARCHITECTURE currently describe the wrong technology stack (Python).
+The recorded Phase 8 verification included:
 
-## Known Limitations (V2.0)
+- `cargo fmt --check`
+- `cargo check`
+- `cargo clippy`
+- `cargo test`
+- `npm run specta:check`
 
-*   **Linux Only:** Windows/macOS builds are not produced or supported.
-*   **Wi-Fi Security:** HTTP only. No TLS. Vulnerable to LAN snooping. Use on trusted networks only.
-*   **No Resumable Uploads:** Interrupted Wi-Fi uploads must restart from zero.
-*   **EXIF Support:** Limited to JPEG/TIFF. HEIC/WebP/RAW fall back to filename/mtime.
-*   **Cross-FS Dedup:** Moves across filesystems are copy+delete, not strictly atomic.
+The recorded test result was **110 passed and 4 ignored**. The ignored tests were hardware-specific tests.
 
-## Deferred / Out of Scope
+Frontend checks and production build were also used during packaging.
 
-*   iOS Support
-*   Native Android Companion App (uses mobile browser)
-*   Cloud Storage Integration
-*   EXIF Write-back
-*   HTTPS for Wi-Fi (requires native app for pinning)
+These results describe recorded local verification. They do not establish that GitHub Actions has passed for the final release commit.
 
-## Sign-off Criteria
+## Release artifacts
 
-- [ ] `cargo test` passes (including real `dedup` tests).
-- [ ] `npm run check` && `npm run build` passes.
-- [ ] Real Android MTP backup successful.
-- [ ] Real Android Wi-Fi backup successful.
-- [ ] Real Takeout ZIP organization successful.
-- [ ] Duplicate scan/move/undo successful on real files.
-- [ ] AppImage/deb installs and runs on clean Linux profile.
-- [ ] README/ARCHITECTURE accurately describe V2.
-- [ ] CI runs V2 checks.
+The final distribution files are:
+
+- `SyncUp V2_2.0.0_amd64.deb`
+- `SyncUp V2_2.0.0_amd64.AppImage`
+
+The older `SyncUp_2.0.0_amd64.deb` was generated before the product-name change and is superseded. It must not be distributed as the final V2 package.
+
+## Known limitations
+
+1. **Linux only:** Windows and macOS packages are not provided.
+2. **Wi-Fi encryption:** The local Wi-Fi upload server uses HTTP without TLS. Use only on trusted networks.
+3. **Upload resumption:** Interrupted Wi-Fi uploads may need to be restarted.
+4. **Metadata support:** Date extraction depends on supported metadata and file formats.
+5. **Cross-filesystem moves:** Cross-filesystem operations cannot guarantee the same atomic rename behavior as same-filesystem operations.
+6. **Clean-machine coverage:** Installation and launch were verified on the development machine, not on a separate clean Linux installation.
+
+## CI
+
+The repository contains a GitHub Actions workflow for frontend checks, Rust formatting, compilation, linting, and tests. A Specta binding consistency check is included in the release-preparation change.
+
+The workflow must run successfully on GitHub before CI can be marked as release-verified.
+
+## Release checklist
+
+- [x] Core feature implementation completed.
+- [x] Physical Android MTP backup tested.
+- [x] Physical Wi-Fi upload tested.
+- [x] Real Takeout archive tested.
+- [x] Duplicate scan, quarantine move, and Undo tested.
+- [x] Debian package built, installed, and launched.
+- [x] AppImage built and launched.
+- [x] Product name changed to SyncUp V2.
+- [x] Legacy SyncUp 1.4.1 desktop entry preserved.
+- [x] Wi-Fi security limitation documented.
+- [ ] Documentation changes committed.
+- [ ] CI workflow verified on GitHub.
+- [ ] Release tag created and pushed.
+- [ ] GitHub release published with final packages and checksums.

@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "SyncUp",
+  "productName": "SyncUp V2",
   "version": "2.0.0",
   "identifier": "io.github.lotus-projects-3421.syncup",
   "build": {

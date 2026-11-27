@@ -1,83 +1,168 @@
-# SyncUp v2
+# SyncUp V2
 
-Safe Android photo/video backup and Google Takeout organization for Linux.
+**Safe Android photo/video backup and Google Takeout organization for Linux.**
 
-SyncUp v2 is a complete rewrite of the original Python/Flet application, built with **Tauri 2**, **Rust**, and **Svelte 5**. It prioritizes data safety: no file is ever overwritten without prior verification, duplicates are moved to quarantine (not deleted), and all destructive operations are crash-safe and reversible.
+SyncUp V2 is a desktop application built with Tauri 2, Rust, Svelte 5, and TypeScript. It provides local Android media backup, wireless uploads, Google Takeout organization, and reversible duplicate cleanup.
 
-## Status: Pre-Release (Linux Only)
+**Current version: 2.0.0**
 
-This is **v2.0.0-pre**. It is functional but undergoing final validation.
+## Platform support
 
-*   **Platform:** Linux only (tested on Ubuntu/Zorin). Windows/macOS are not supported in v2.0.
-*   **Wi-Fi Security:** Uses HTTP on the local LAN. **Not encrypted.** Use only on trusted networks.
-*   **Testing:** Core logic is unit-tested. Real-device MTP and Wi-Fi flows require manual validation (see `docs/RELEASE_STATUS.md`).
+- Linux desktop, x86_64 release packages.
+- Debian package (`.deb`) and AppImage distributions.
+- Windows and macOS builds are not currently provided.
+
+The release has been built and launched on Zorin OS 18.1 (Ubuntu 24.04-based).
 
 ## Features
 
-*   **Phone Backup (MTP):** Back up photos/videos from Android devices via USB. Uses Linux GVFS/GIO.
-*   **Wi-Fi Backup:** Wireless backup via QR code. Phone uploads to a temporary staging area; files are verified and published atomically.
-*   **Google Takeout Organizer:** Stream-processes Takeout ZIPs. Organizes by date (Year/Month/Day) using JSON sidecars, EXIF, or filenames.
-*   **Duplicate Finder:** Scans for duplicates using size + BLAKE2b hash. Moves duplicates to a `_Duplicates_` quarantine folder with a manifest for safe **Undo**.
-*   **Legacy Migration:** Imports settings and backup history from SyncUp v1 (Python) safely.
+### Android phone backup (USB / MTP)
 
-## Prerequisites
+- Discover and browse Android devices through Linux GVFS/GIO.
+- Select media for backup.
+- Verify copied files using size and BLAKE2b checks.
 
-*   **Rust:** 1.100.0+ (`rustup`)
-*   **Node.js:** v24.x LTS (`nvm` recommended)
-*   **System Libraries (Ubuntu/Debian):**
-    ```bash
-    sudo apt update
-    sudo apt install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
-      libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
-      libglib2.0-bin pkg-config git
-    ```
-    *Note: `libglib2.0-bin` provides `gio`, required for MTP device discovery.*
+### Wi-Fi backup
 
-## Development
+- Pair a phone using a QR code.
+- Upload photos and videos through the phone's browser.
+- Receive files into a staging area before verification and publication.
 
-Clone the repository and install dependencies:
+**Security limitation:** Wi-Fi transfers use HTTP without TLS encryption. Data is not encrypted in transit. Use this feature only on a trusted local network. Do not use it on public or untrusted Wi-Fi networks.
+
+### Google Takeout Organizer
+
+- Process Google Takeout ZIP archives.
+- Organize media by date.
+- Use available date information from Takeout metadata, EXIF data, and filenames.
+- Preserve source archives while processing.
+
+### Duplicate Finder
+
+- Identify duplicate files using size and BLAKE2b hashing.
+- Move selected duplicates into quarantine rather than permanently deleting them.
+- Maintain manifests to support restoration through Undo.
+
+### Legacy data import
+
+- Import supported settings and backup history from the original SyncUp application.
+- The original v1 application is a separate legacy product.
+
+## Installation
+
+### Debian / Ubuntu-based distributions
+
+Download the `SyncUp V2` `.deb` package, then run this command from the directory containing the downloaded file:
+
+```bash
+sudo apt install "./SyncUp V2_2.0.0_amd64.deb"
+```
+
+### AppImage
+
+Download the AppImage, then run:
+
+```bash
+chmod +x "SyncUp V2_2.0.0_amd64.AppImage"
+./SyncUp\ V2_2.0.0_amd64.AppImage
+```
+
+The AppImage and Debian package are separate distribution formats. Use the one appropriate for your system.
+
+## Development setup
+
+### Requirements
+
+- Rust toolchain (rustup).
+- Node.js 24.
+- npm.
+- Linux development libraries required by Tauri 2 and WebKitGTK.
+- GVFS/GIO support for USB MTP device access.
+
+On Ubuntu 24.04-based distributions, development dependencies include:
+
+```bash
+sudo apt update
+sudo apt install -y \
+  libwebkit2gtk-4.1-dev \
+  build-essential curl wget file \
+  libxdo-dev libssl-dev \
+  libayatana-appindicator3-dev \
+  librsvg2-dev libglib2.0-bin \
+  pkg-config git
+```
+
+### Clone and install
 
 ```bash
 git clone https://github.com/Lotus-Projects-3421/syncup.git
 cd syncup
-npm install
+npm ci
 ```
 
-Run in development mode (hot-reload):
+### Development mode
 
 ```bash
 npm run tauri dev
 ```
 
-## Building
-
-To produce a release binary (AppImage, deb):
+### Checks
 
 ```bash
-npm run tauri build
+npm run check
+npm run build
+npm run specta:check
+
+cargo fmt --manifest-path src-tauri/Cargo.toml --check
+cargo check --manifest-path src-tauri/Cargo.toml
+cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-Artifacts will be in `src-tauri/target/release/bundle/`.
+### Build release packages
 
-## Project Structure
+```bash
+npm run tauri -- build --bundles deb,appimage
+```
 
-*   `src/`: Svelte 5 frontend (UI, routing, state).
-*   `src-tauri/`: Rust backend (IPC, services, storage, platform logic).
-*   `src-tauri/src/services/`: Core workflows (backup, wifi, organizer, dedup, fileops).
-*   `src-tauri/src/platform/`: OS-specific code (Linux MTP).
-*   `docs/`: Architecture, plans, and progress logs.
+Build outputs are placed under:
 
-## Safety Principles
+```text
+src-tauri/target/release/bundle/
+```
 
-1.  **Atomic Publish:** Files are written to a temporary location, verified (size/hash), and only then moved to the final destination.
-2.  **No Silent Overwrites:** Existing files are preserved unless explicit "Overwrite" mode is selected (and even then, via atomic replace).
-3.  **Reversible Dedup:** Duplicate cleanup moves files to a quarantine folder with a manifest. Undo restores them.
-4.  **Crash Safety:** Database updates happen only after file durability is confirmed. Manifests are fsynced before moves.
+## Architecture
 
-## Legacy Support (v1)
+- `src/` — Svelte 5 frontend.
+- `src-tauri/` — Rust and Tauri backend.
+- `src-tauri/src/commands/` — frontend-facing commands.
+- `src-tauri/src/services/` — backup, Wi-Fi, organizer, duplicate detection, and file operations.
+- `src-tauri/src/platform/` — platform-specific functionality.
+- `docs/` — architecture, specifications, audit, plans, and operational documentation.
 
-The original Python/Flet application is preserved in the repository history and `archive/` (if present). SyncUp v2 can import your existing backup database and settings from v1 via the **Settings > Legacy Data Import** screen.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the system design.
+
+## Data safety
+
+SyncUp is designed around the following principles:
+
+1. Verify newly copied data before publishing it.
+2. Avoid silently overwriting existing files.
+3. Use staging and atomic publication where supported.
+4. Keep duplicate cleanup reversible through quarantine manifests.
+5. Preserve source data during Takeout organization and legacy import.
+
+These safeguards reduce risk but do not replace maintaining independent backups of important files.
+
+## Known limitations
+
+- Linux only; no Windows or macOS release.
+- Wi-Fi transfers use unencrypted HTTP.
+- Interrupted Wi-Fi uploads may need to be restarted.
+- Metadata extraction depends on supported formats and available metadata.
+- Cross-filesystem moves cannot guarantee the same atomic rename behavior as same-filesystem operations.
+- Installation and launch were verified on the development machine, not on a separate clean Linux installation.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+SyncUp V2 is distributed under the MIT License. See [LICENSE](LICENSE).

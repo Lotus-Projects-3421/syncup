@@ -47,6 +47,9 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      - name: Check generated TypeScript bindings
+        run: npm run specta:check
+
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
 
